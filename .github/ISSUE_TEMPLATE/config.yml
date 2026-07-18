@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Design discussion
+    url: https://github.com/himanshudhawale/kura-metadata-store/discussions
+    about: Discuss an early idea before writing a complete feature request.
+  - name: Security report
+    url: https://github.com/himanshudhawale/kura-metadata-store/security/advisories/new
+    about: Report a suspected vulnerability privately.
