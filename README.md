@@ -49,19 +49,19 @@ Client API
     |
     v
 +-----------------------------+
-| Raft consensus              |  Phase 3
+| Raft consensus              |  Phase 4
 | leader, log, quorum, reads  |
 +-----------------------------+
     |
     v committed commands
 +-----------------------------+
-| Deterministic state machine |  Phase 1
+| Deterministic state machine |  Phases 1-2
 | KV, revisions, Txn, Watch   |
 +-----------------------------+
     |
     v
 +-----------------------------+
-| WAL + snapshots + backend   |  Phase 2
+| WAL + snapshots + backend   |  Phase 3
 +-----------------------------+
 ```
 
