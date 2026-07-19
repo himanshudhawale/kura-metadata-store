@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" role="img" aria-labelledby="title description">
+  <title id="title">Kura Metadata Store</title>
+  <desc id="description">Kura Metadata Store wordmark beside a K monogram in an isometric data cube.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0e0b20"/>
+      <stop offset="1" stop-color="#34245e"/>
+    </linearGradient>
+    <linearGradient id="edge" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#d9b1ff"/>
+      <stop offset="1" stop-color="#7163ff"/>
+    </linearGradient>
+  </defs>
+  <rect width="1280" height="640" fill="url(#background)"/>
+  <circle cx="1100" cy="88" r="180" fill="#956fff" opacity=".09"/>
+  <circle cx="1080" cy="600" r="260" fill="#c59aff" opacity=".05"/>
+  <g transform="translate(92 80) scale(.94)">
+    <path d="M256 24 456 139v250L256 504 56 389V139Z" fill="#1a1535" stroke="url(#edge)" stroke-width="20" stroke-linejoin="round"/>
+    <path d="m56 139 200 115 200-115M256 254v250" fill="none" stroke="#9a7cff" stroke-width="13" opacity=".72"/>
+    <path d="M170 145v220M180 278 329 144M180 274l160 98" fill="none" stroke="#fbf9ff" stroke-width="42" stroke-linecap="round" stroke-linejoin="round"/>
+    <g fill="#e2c5ff" stroke="#271d4c" stroke-width="6">
+      <circle cx="56" cy="389" r="15"/>
+      <circle cx="256" cy="504" r="15"/>
+      <circle cx="456" cy="389" r="15"/>
+    </g>
+  </g>
+  <text x="610" y="245" fill="#fbf9ff" font-family="Segoe UI, Arial, sans-serif" font-size="104" font-weight="700" letter-spacing="-3">Kura</text>
+  <text x="610" y="340" fill="#d5b1ff" font-family="Segoe UI, Arial, sans-serif" font-size="57" font-weight="650" letter-spacing="5">METADATA</text>
+  <text x="610" y="415" fill="#9c88ff" font-family="Segoe UI, Arial, sans-serif" font-size="57" font-weight="650" letter-spacing="8">STORE</text>
+  <path d="M614 449h470" stroke="#9a7cff" stroke-width="5" stroke-linecap="round" opacity=".75"/>
+</svg>

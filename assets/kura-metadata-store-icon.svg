@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title description">
+  <title id="title">Kura Metadata Store icon</title>
+  <desc id="description">A white K monogram constructed inside an isometric violet data cube with metadata nodes.</desc>
+  <defs>
+    <linearGradient id="field" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#100d24"/>
+      <stop offset="1" stop-color="#2d2052"/>
+    </linearGradient>
+    <linearGradient id="edge" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#d3a6ff"/>
+      <stop offset="1" stop-color="#7667ff"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#field)"/>
+  <path d="M256 72 406 158v196L256 440 106 354V158Z" fill="#1a1535" stroke="url(#edge)" stroke-width="18" stroke-linejoin="round"/>
+  <path d="m106 158 150 86 150-86M256 244v196" fill="none" stroke="#9a7cff" stroke-width="12" stroke-linejoin="round" opacity=".72"/>
+  <path d="M190 166v180M198 275l118-106M198 271l127 78" fill="none" stroke="#fbf9ff" stroke-width="35" stroke-linecap="round" stroke-linejoin="round"/>
+  <g fill="#e2c5ff" stroke="#271d4c" stroke-width="5">
+    <circle cx="106" cy="354" r="13"/>
+    <circle cx="256" cy="440" r="13"/>
+    <circle cx="406" cy="354" r="13"/>
+  </g>
+</svg>
