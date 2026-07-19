@@ -288,3 +288,24 @@ Public errors will distinguish:
 - Corrupt WAL or snapshot
 
 Errors must never turn an uncertain write into a success-shaped response.
+
+## 9. Internal Raft election boundary
+
+The first internal Raft-core slice is event driven:
+
+```text
+Core(self, peers, recoveredHardState, seed, timeoutRange, localLog)
+start()                 -> ordered election effects
+step(typed input)       -> ordered election effects
+snapshot()              -> immutable diagnostic state
+```
+
+Inputs are logical election deadlines, RequestVote requests/responses, and the
+existing explicit hard-state completion event. Effects expose role changes,
+hard-state persistence requests, outbound RequestVote messages, and election
+timer reset/cancel operations. Timeout selection is deterministic from an
+explicit seed and inclusive logical-tick range; the core never reads a clock.
+
+This boundary reports a leader after a fixed odd-cluster vote quorum but does
+not replicate or commit log entries. Details and ordering guarantees are in
+[Design 0009](design/0009-raft-election-core.md).

@@ -2,11 +2,10 @@
 
 ## Status and scope
 
-Accepted as the Phase 4 simulation foundation. This change supplies a
-logical-time scheduler and an adapter boundary for the Raft implementation
-planned by issue #6. It deliberately supplies a deterministic probe node only:
-there is no election, replication, quorum, or consensus implementation in this
-change.
+Accepted as the Phase 4 simulation foundation. The original change supplied a
+logical-time scheduler and deterministic probe. The RequestVote-only election
+slice now also supplies the first real adapter; AppendEntries, replication,
+commitment, and a distributed service remain absent.
 
 ## Problem
 
@@ -23,10 +22,10 @@ same schedule again.
 
 ## Why a separate adapter
 
-The Raft core does not exist yet. Coupling the simulator to placeholder
-election methods would either constrain issue #6 prematurely or create a fake
+The simulator was introduced before the Raft core. Coupling it to placeholder
+election methods would have constrained issue #6 prematurely or created a fake
 consensus implementation. Instead, `NodeAdapter` is the environmental boundary
-that the real core can implement or be wrapped by:
+now used by the RequestVote-only core:
 
 ```text
 environment event -> NodeAdapter::step(event) -> zero or more actions
@@ -39,10 +38,10 @@ state encoding. `NodeAdapter::step` is synchronous and must be deterministic;
 the simulator owns all delayed effects.
 
 `StartEvent` supplies the node identity, sorted peer set, and completed durable
-records. A future Raft adapter can restore its term, vote, and log before
-producing actions. `PersistedEvent` is the only acknowledgement that makes a
-`PersistAction` durable. This is the stable seam issue #6 needs without making
-claims about consensus.
+records. The election adapter restores its term and vote before producing
+actions; later replication adapters can also restore the log. `PersistedEvent`
+is the only acknowledgement that makes a `PersistAction` durable. This is the
+stable seam issue #6 needs without making claims about committed consensus.
 
 ## Design
 
