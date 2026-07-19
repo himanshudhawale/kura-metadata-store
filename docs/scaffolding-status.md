@@ -33,13 +33,15 @@ Implemented now:
   nextIndex/matchIndex retry, and persistence-gated follower success
 - Current-term majority commitment, safe prior-term indirect commitment, and
   ordered completion-driven state-machine apply
+- Context-correlated ReadIndex with current-term quorum confirmation,
+  applied-index gating, explicit uncertainty, and bounded pending reads
 
 Declared but not implemented:
 
 - Historical MVCC
 - Integration of state-machine commands with the WAL and snapshot body
 - Embedded durable backend
-- Production Raft transport, membership, snapshots, and ReadIndex
+- Production Raft transport, membership, and snapshots
 - Network server, authentication, and metrics
 - Remote client transport and real leader-failover integration
 

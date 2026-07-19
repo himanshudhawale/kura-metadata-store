@@ -193,7 +193,10 @@ void gate_on_hard_state(StepResult& result) {
         .deferred_effects = std::move(deferred)};
 }
 
-AppendEntriesRequest append_request(const State& state, const NodeId peer) {
+AppendEntriesRequest append_request(
+    const State& state,
+    const NodeId peer,
+    const std::optional<ReadIndexContext> read_context = std::nullopt) {
     const auto& progress = state.leader->progress.at(peer);
     const auto previous = progress.next_index.value - 1;
     std::vector<LogEntry> entries;
@@ -209,13 +212,19 @@ AppendEntriesRequest append_request(const State& state, const NodeId peer) {
         .previous_log_index = {previous},
         .previous_log_term = term_at(state, previous),
         .entries = std::move(entries),
-        .leader_commit = state.volatile_state.commit_index};
+        .leader_commit = state.volatile_state.commit_index,
+        .read_context = read_context};
 }
 
-void send_append(StepResult& result, const NodeId peer) {
+void send_append(
+    StepResult& result,
+    const NodeId peer,
+    const std::optional<ReadIndexContext> read_context = std::nullopt) {
     result.rules.push_back(RuleId::leader_replicate);
     result.effects.push_back(
-        SendAppendEntries{peer, append_request(result.state, peer)});
+        SendAppendEntries{
+            peer,
+            append_request(result.state, peer, read_context)});
 }
 
 void initialize_leader(StepResult& result) {
@@ -362,7 +371,11 @@ void handle_append_entries(
         result.rules.push_back(RuleId::append_entries_reject_stale);
         result.effects.push_back(SendAppendEntriesResponse{
             event.from,
-            {result.state.persistent.current_term, false, {}}});
+            {
+                result.state.persistent.current_term,
+                false,
+                {},
+                event.request.read_context}});
         return;
     }
     if (was_candidate) {
@@ -381,7 +394,11 @@ void handle_append_entries(
         result.rules.push_back(RuleId::append_entries_reject_log_mismatch);
         result.effects.push_back(SendAppendEntriesResponse{
             event.from,
-            {result.state.persistent.current_term, false, {}}});
+            {
+                result.state.persistent.current_term,
+                false,
+                {},
+                event.request.read_context}});
         return;
     }
 
@@ -410,7 +427,8 @@ void handle_append_entries(
                     {
                         result.state.persistent.current_term,
                         false,
-                        {}}});
+                        {},
+                        event.request.read_context}});
                 return;
             }
             result.state.persistent.log.erase(
@@ -451,7 +469,8 @@ void handle_append_entries(
         {
             result.state.persistent.current_term,
             true,
-            {previous + event.request.entries.size()}}});
+            {previous + event.request.entries.size()},
+            event.request.read_context}});
 }
 
 void advance_leader_commit(StepResult& result) {
@@ -505,9 +524,13 @@ void handle_append_entries_response(
         advance_leader_commit(result);
     } else {
         progress.next_index = {
-            std::max<std::uint64_t>(1, progress.next_index.value - 1)};
+            std::max(
+                progress.match_index.value + 1,
+                std::max<std::uint64_t>(
+                    1,
+                    progress.next_index.value - 1))};
         result.rules.push_back(RuleId::leader_retry_replication);
-        send_append(result, event.from);
+        send_append(result, event.from, event.response.read_context);
     }
 }
 

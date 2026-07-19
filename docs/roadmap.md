@@ -75,8 +75,8 @@ This phase is durable but remains single-node and not highly available.
 
 **Status:** Started. Deterministic elections, RequestVote, AppendEntries log
 replication, majority commitment, and ordered application are implemented in
-the first three internal core slices. ReadIndex, snapshots, and distributed
-service integration remain unimplemented.
+the first four internal core slices, including quorum-confirmed ReadIndex.
+Snapshots and distributed service integration remain unimplemented.
 
 Deliver:
 
