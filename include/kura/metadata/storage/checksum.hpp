@@ -5,12 +5,7 @@
 
 namespace kura::metadata {
 
-class Checksum {
-public:
-    virtual ~Checksum() = default;
-
-    [[nodiscard]] virtual std::uint32_t compute(
-        std::span<const std::uint8_t> bytes) const = 0;
-};
+[[nodiscard]] std::uint32_t crc32c(
+    std::span<const std::uint8_t> bytes) noexcept;
 
 }  // namespace kura::metadata

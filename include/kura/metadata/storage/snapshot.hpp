@@ -10,7 +10,7 @@ namespace kura::metadata {
 struct Snapshot {
     SnapshotMetadata metadata;
     std::vector<std::uint8_t> state;
-    std::vector<std::uint8_t> integrity_hash;
+    std::uint32_t checksum{};
 };
 
 }  // namespace kura::metadata

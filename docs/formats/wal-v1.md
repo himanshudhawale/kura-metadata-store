@@ -49,4 +49,3 @@ an incomplete record header, or an incomplete payload following a complete
 structurally valid header, at EOF of the highest-numbered segment. Segment
 headers are never treated as tear-recoverable. No resynchronization scan is
 performed.
-

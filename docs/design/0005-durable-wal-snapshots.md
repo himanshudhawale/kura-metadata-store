@@ -99,9 +99,11 @@ Before appending a record, the implementation checks all configured and format
 limits without allocation. If adding it would exceed `wal_segment_bytes`, a
 new segment is atomically created first. A nonempty record must fit in an empty
 segment; otherwise append is rejected. The former segment is sealed by policy:
-it is never opened for append again. A batch can durably leave a valid prefix
-if a later write fails; the call reports failure, and retry/recovery must use
-the recovered last index.
+it is synchronized before rotation, even for a nonsynchronized append, and is
+never opened for append again. This prevents a later weak-durability operation
+from turning a previously acknowledged prefix into an interior torn record. A
+batch can durably leave a valid prefix if a later write fails; the call reports
+failure, and retry/recovery must use the recovered last index.
 
 Only the highest-numbered segment is appendable after recovery. Rotation is
 serialized within one WAL object. Concurrent processes are forbidden.
@@ -224,4 +226,3 @@ index gaps/regressions and overflow; configured record/payload/snapshot limits;
 snapshot round-trip and checksum rejection; stale/partial temporary files;
 refused replacement; and truncation without snapshot coverage. Tests construct
 byte-boundary faults directly and never depend on sleeps or timing.
-
