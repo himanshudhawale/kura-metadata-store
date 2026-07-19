@@ -23,3 +23,15 @@
 
 No chaos result is accepted unless the random seed and operation history are
 preserved for reproduction.
+
+## Deterministic Raft simulation
+
+The [Raft simulator design](design/0006-deterministic-raft-simulator.md)
+defines the logical-time event/action boundary intended for the future Raft
+core. Simulation tests must not use sleeps or read wall-clock time. A failure
+must use `Simulator::require` (or propagate an adapter failure) so its `sim-v1`
+seed, fault controls, and selected event history are printed and can be passed
+to `Simulator::replay`.
+
+The current deterministic probe validates scheduling and every fault control;
+it is not evidence that leader election or consensus is implemented.

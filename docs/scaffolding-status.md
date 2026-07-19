@@ -28,7 +28,9 @@ Declared but not implemented:
 - Historical MVCC
 - Integration of state-machine commands with the WAL and snapshot body
 - Embedded durable backend
-- Production Raft node, membership, snapshots, and ReadIndex
+- Production Raft node, membership, snapshots, and ReadIndex (the executable
+  Figure 2 specification and deterministic simulation harness exist; the
+  consensus core does not)
 - Network server, authentication, and metrics
 - Remote client and Kura helper
 
