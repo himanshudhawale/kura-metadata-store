@@ -556,9 +556,14 @@ public:
             && !core_->snapshot().waiting_for_persistence
             && next_leader_command_
                 < config_.commands_on_leadership.size()) {
-            auto proposal = translate(core_->step(
+            const Input proposal_input =
                 figure2::ReceiveClientCommand{
-                    config_.commands_on_leadership[next_leader_command_++]}));
+                    config_.commands_on_leadership[next_leader_command_++]};
+            if (config_.client_observer) {
+                config_.client_observer(expected_, proposal_input);
+            }
+            auto proposal =
+                translate(core_->step(proposal_input));
             actions.insert(
                 actions.end(),
                 std::make_move_iterator(proposal.begin()),
@@ -595,8 +600,12 @@ public:
             && !after_snapshot.waiting_for_persistence
             && current_term_committed
             && next_read_request_ < config_.reads_on_leadership.size()) {
-            auto read = translate(core_->step(
-                config_.reads_on_leadership[next_read_request_++]));
+            const Input read_input =
+                config_.reads_on_leadership[next_read_request_++];
+            if (config_.client_observer) {
+                config_.client_observer(expected_, read_input);
+            }
+            auto read = translate(core_->step(read_input));
             actions.insert(
                 actions.end(),
                 std::make_move_iterator(read.begin()),
@@ -755,6 +764,9 @@ private:
         std::vector<simulation::NodeAction> actions;
         std::vector<RestoreStateMachineSnapshot> restores;
         for (const auto& effect : result.effects) {
+            if (config_.effect_observer) {
+                config_.effect_observer(expected_, effect);
+            }
             std::visit(
                 [&actions, &restores](const auto& typed) {
                     using Typed = std::decay_t<decltype(typed)>;

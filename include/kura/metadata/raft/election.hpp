@@ -255,6 +255,10 @@ private:
 };
 
 using SimulationObserver = std::function<void(NodeId, const Snapshot&)>;
+using SimulationEffectObserver =
+    std::function<void(NodeId, const Effect&)>;
+using SimulationClientObserver =
+    std::function<void(NodeId, const Input&)>;
 
 struct SimulationConfig {
     TimeoutRange timeouts;
@@ -267,6 +271,8 @@ struct SimulationConfig {
     std::size_t max_pending_reads{128};
     std::size_t max_read_history{4'096};
     SimulationObserver observer;
+    SimulationEffectObserver effect_observer;
+    SimulationClientObserver client_observer;
 };
 
 [[nodiscard]] simulation::NodeFactory make_simulation_factory(

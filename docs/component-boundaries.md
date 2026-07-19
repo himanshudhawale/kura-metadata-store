@@ -11,6 +11,7 @@ future phases are implemented.
 | `lease/` | Replicated TTL records and expiration proposals | 2 |
 | `storage/` | WAL, backend, checksums, snapshots, and quotas | 3 |
 | `raft/` | Election, replication, commitment, ReadIndex, snapshots, membership | 4 |
+| `testing/` | Bounded linearizability history models and replay | 4 |
 | `server/` | Process configuration, auth context, health, and metrics | 3-5 |
 | `client/` | Endpoint selection, retry, transactions, watch resume | 3-5 |
 | `kura/` | Safe Kura Engine snapshot-publication composition | 6 |

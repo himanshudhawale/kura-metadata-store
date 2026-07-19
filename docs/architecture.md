@@ -146,7 +146,21 @@ Compacting MVCC history makes old revisions unavailable. A watch that asks for
 a compacted revision receives an explicit compaction error and must resynchronize
 with a current range read.
 
-## 8. Membership
+## 8. Deterministic consensus acceptance
+
+The internal test boundary composes the real event-driven Raft node with the
+logical-time simulator. Three- and five-voter schedules exercise persistence
+completion, commit/apply, ReadIndex, partitions, message faults, crashes,
+restart, and snapshot catch-up. Typed get/put/erase/CAS histories are checked
+against a bounded sequential specification. Simulator and history failures
+emit replayable traces.
+
+This establishes issue #6 only at its deterministic core boundary. It does not
+replace a production transport, server, embedded durable state machine,
+membership protocol, authenticated operations, or external-client
+linearizability testing.
+
+## 9. Membership
 
 Membership changes happen one node at a time. New nodes enter as non-voting
 learners, receive a snapshot and log tail, and become voting members only after
@@ -155,7 +169,7 @@ catching up. This avoids increasing quorum before a new node can participate.
 Each cluster has a unique cluster ID and bootstrap token to prevent accidental
 cross-cluster joining.
 
-## 9. Security boundary
+## 10. Security boundary
 
 Production mode requires:
 
@@ -168,7 +182,7 @@ Production mode requires:
 
 Security is part of protocol design, not a proxy added after production.
 
-## 10. Observability
+## 11. Observability
 
 Every request carries a request ID and trace context. Required diagnostics
 include:

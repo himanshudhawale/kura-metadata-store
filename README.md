@@ -18,9 +18,10 @@ WAL, networking, and state-machine execution.
 > machine. Phase 3 WAL/snapshot storage and atomic Raft term/vote persistence
 > boundaries exist but are not connected to mutation responses. A deterministic
 > logical-time Raft simulator, executable Figure 2 specification, and internal
-> election, AppendEntries, majority-commit, and ordered-apply slices exist, but
-> quorum-confirmed ReadIndex and deterministic Raft snapshot installation are
-> now included. A production Raft service does not exist. An in-process Kura helper
+> election, AppendEntries, majority-commit, ordered-apply, ReadIndex, snapshot,
+> and deterministic acceptance slices are implemented, including bounded
+> linearizability history checking. A production Raft service does not exist.
+> An in-process Kura helper
 > safely composes snapshot transactions, leases, and watches without claiming a
 > remote or distributed client. The service is not distributed,
 > replicated, durably integrated, or highly available. Do not use it for
@@ -129,6 +130,7 @@ not read a wall clock, and no background expiry driver is implemented.
 - [Raft majority commit and apply design](docs/design/0012-raft-commit-apply.md)
 - [Raft ReadIndex design](docs/design/0013-raft-read-index.md)
 - [Raft snapshot and InstallSnapshot design](docs/design/0014-raft-snapshots.md)
+- [Raft acceptance and linearizability design](docs/design/0015-raft-acceptance-linearizability.md)
 - [WAL format v1](docs/formats/wal-v1.md)
 - [Snapshot format v1](docs/formats/snapshot-v1.md)
 - [Raft hard-state format v1](docs/formats/raft-hard-state-v1.md)
