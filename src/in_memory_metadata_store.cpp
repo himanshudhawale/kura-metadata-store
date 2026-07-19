@@ -1,5 +1,7 @@
 #include "kura/metadata/in_memory_metadata_store.hpp"
 
+#include "kura/metadata/core/store_error.hpp"
+
 #include <algorithm>
 #include <limits>
 #include <mutex>
@@ -48,17 +50,26 @@ bool comparison_matches(
 }  // namespace
 
 InMemoryMetadataStore::InMemoryMetadataStore(
-    const std::int64_t initial_revision)
-    : revision_(initial_revision) {
+    const std::int64_t initial_revision,
+    StoreLimits limits)
+    : limits_(limits),
+      revision_(initial_revision),
+      compact_revision_(initial_revision) {
     if (initial_revision < 0) {
         throw std::invalid_argument("initial revision must not be negative");
     }
 }
 
+InMemoryMetadataStore::InMemoryMetadataStore(StoreLimits limits)
+    : InMemoryMetadataStore(0, limits) {}
+
 InMemoryMetadataStore::InMemoryMetadataStore(
     std::vector<KeyValue> initial_values,
-    const std::int64_t initial_revision)
-    : revision_(initial_revision) {
+    const std::int64_t initial_revision,
+    StoreLimits limits)
+    : limits_(limits),
+      revision_(initial_revision),
+      compact_revision_(initial_revision) {
     if (initial_revision < 0) {
         throw std::invalid_argument("initial revision must not be negative");
     }
@@ -129,8 +140,19 @@ DeleteResult InMemoryMetadataStore::erase(const ByteSequence& key) {
 
     const std::int64_t mutation_revision = next_revision_locked();
     KeyValue previous = iterator->second;
-    values_.erase(iterator);
+    std::map<ByteSequence, KeyValue> working = values_;
+    working.erase(key);
+    const std::vector<WatchEvent> events{WatchEvent{
+        .revision = Revision{mutation_revision},
+        .mutation = MutationEvent{
+            .type = MutationEventType::erase,
+            .current = std::nullopt,
+            .previous = previous}}};
+    StagedWatchPublication publication =
+        stage_watch_publication_locked(events, mutation_revision);
+    values_.swap(working);
     revision_ = mutation_revision;
+    commit_watch_publication_locked(publication);
     return {
         .deleted = true,
         .previous = std::move(previous),
@@ -311,10 +333,11 @@ TransactionResult InMemoryMetadataStore::transaction(
     std::map<ByteSequence, KeyValue> working = values_;
     std::vector<TransactionOperationResult> responses;
     responses.reserve(operations.size());
+    std::vector<WatchEvent> events;
 
     for (const RequestOperation& operation : operations) {
         std::visit(
-            [&working, &responses, transaction_revision](
+            [&working, &responses, &events, transaction_revision](
                 const auto& typed_operation) {
                 using Operation = std::decay_t<decltype(typed_operation)>;
                 if constexpr (std::is_same_v<Operation, RangeRequest>) {
@@ -355,6 +378,12 @@ TransactionResult InMemoryMetadataStore::transaction(
                             typed_operation.key,
                             current);
                     static_cast<void>(inserted);
+                    events.push_back(WatchEvent{
+                        .revision = Revision{transaction_revision},
+                        .mutation = MutationEvent{
+                            .type = MutationEventType::put,
+                            .current = stored->second,
+                            .previous = previous}});
                     responses.emplace_back(PutResult{
                         .current = stored->second,
                         .previous = typed_operation.return_previous
@@ -368,9 +397,16 @@ TransactionResult InMemoryMetadataStore::transaction(
                         working.lower_bound(typed_operation.range.start);
                     while (iterator != working.end()
                            && iterator->first < typed_operation.range.end) {
+                        const KeyValue erased = iterator->second;
                         if (typed_operation.return_previous) {
-                            previous.push_back(iterator->second);
+                            previous.push_back(erased);
                         }
+                        events.push_back(WatchEvent{
+                            .revision = Revision{transaction_revision},
+                            .mutation = MutationEvent{
+                                .type = MutationEventType::erase,
+                                .current = std::nullopt,
+                                .previous = erased}});
                         iterator = working.erase(iterator);
                         ++deleted;
                     }
@@ -383,17 +419,20 @@ TransactionResult InMemoryMetadataStore::transaction(
             operation);
     }
 
+    std::optional<StagedWatchPublication> publication;
+    if (has_effective_mutation) {
+        publication =
+            stage_watch_publication_locked(events, transaction_revision);
+    }
     values_.swap(working);
     revision_ = transaction_revision;
+    if (publication.has_value()) {
+        commit_watch_publication_locked(*publication);
+    }
     return {
         .header = ResponseHeader{.revision = transaction_revision},
         .succeeded = comparisons_succeeded,
         .responses = std::move(responses)};
-}
-
-std::int64_t InMemoryMetadataStore::revision() const {
-    const std::shared_lock lock(mutex_);
-    return revision_;
 }
 
 PutResult InMemoryMetadataStore::put_locked(
@@ -424,13 +463,261 @@ PutResult InMemoryMetadataStore::put_locked(
         .mod_revision = mutation_revision,
         .lease_id = 0};
 
-    const auto [stored, inserted] = values_.insert_or_assign(key, current);
+    std::map<ByteSequence, KeyValue> working = values_;
+    const auto [stored, inserted] = working.insert_or_assign(key, current);
     static_cast<void>(inserted);
+    const std::vector<WatchEvent> events{WatchEvent{
+        .revision = Revision{mutation_revision},
+        .mutation = MutationEvent{
+            .type = MutationEventType::put,
+            .current = stored->second,
+            .previous = previous}}};
+    StagedWatchPublication publication =
+        stage_watch_publication_locked(events, mutation_revision);
+    values_.swap(working);
     revision_ = mutation_revision;
+    commit_watch_publication_locked(publication);
     return {
-        .current = stored->second,
+        .current = std::move(current),
         .previous = std::move(previous),
         .revision = mutation_revision};
+}
+
+WatchResponse InMemoryMetadataStore::create_watch(
+    const WatchRequest& request) {
+    const std::unique_lock lock(mutex_);
+    if (request.id.value <= 0) {
+        throw StoreError(
+            StatusCode::invalid_argument,
+            "watch ID must be positive");
+    }
+    if (request.range.start.empty()) {
+        throw StoreError(
+            StatusCode::invalid_argument,
+            "watch key must not be empty");
+    }
+    if (!request.range.end.empty()
+        && request.range.start >= request.range.end) {
+        throw StoreError(
+            StatusCode::invalid_argument,
+            "watch range start must be less than range end");
+    }
+    if (request.start_revision.value < 0) {
+        throw StoreError(
+            StatusCode::invalid_argument,
+            "watch start revision must not be negative");
+    }
+    if (watchers_.contains(request.id)) {
+        throw StoreError(
+            StatusCode::invalid_argument,
+            "watch ID is already active");
+    }
+    if (watchers_.size() >= limits_.max_watchers) {
+        throw StoreError(
+            StatusCode::quota_exceeded,
+            "active watcher limit reached");
+    }
+
+    std::int64_t start_revision = request.start_revision.value;
+    if (start_revision == 0) {
+        if (revision_ == std::numeric_limits<std::int64_t>::max()) {
+            throw StoreError(
+                StatusCode::future_revision,
+                "no revision exists after the current revision");
+        }
+        start_revision = revision_ + 1;
+    }
+    if (start_revision <= compact_revision_) {
+        throw StoreError(
+            StatusCode::compacted,
+            "watch start revision has been compacted",
+            compact_revision_);
+    }
+    if (start_revision > revision_
+        && (revision_ == std::numeric_limits<std::int64_t>::max()
+            || start_revision != revision_ + 1)) {
+        throw StoreError(
+            StatusCode::future_revision,
+            "watch start revision is in the future");
+    }
+
+    WatchState state{.request = request};
+    state.request.start_revision = Revision{start_revision};
+    for (const EventBatch& batch : history_) {
+        if (batch.revision < start_revision) {
+            continue;
+        }
+        std::vector<WatchEvent> matching;
+        for (const WatchEvent& event : batch.events) {
+            if (watch_matches(state.request, event)) {
+                matching.push_back(event);
+            }
+        }
+        if (matching.empty() && !state.request.progress_notifications) {
+            continue;
+        }
+        if (state.pending.size()
+            >= limits_.max_watch_pending_responses) {
+            throw StoreError(
+                StatusCode::quota_exceeded,
+                "watch replay exceeds pending response limit");
+        }
+        state.pending.push_back(WatchResponse{
+            .header = ResponseHeader{.revision = batch.revision},
+            .id = request.id,
+            .events = std::move(matching)});
+    }
+
+    watchers_.emplace(request.id, std::move(state));
+    return {
+        .header = ResponseHeader{.revision = revision_},
+        .id = request.id};
+}
+
+std::optional<WatchResponse> InMemoryMetadataStore::poll_watch(
+    const WatchId id) {
+    const std::unique_lock lock(mutex_);
+    const auto iterator = watchers_.find(id);
+    if (iterator == watchers_.end()) {
+        throw StoreError(StatusCode::invalid_argument, "unknown watch ID");
+    }
+    WatchState& state = iterator->second;
+    if (state.terminal.has_value()) {
+        WatchResponse response = std::move(*state.terminal);
+        watchers_.erase(iterator);
+        return response;
+    }
+    if (state.pending.empty()) {
+        return std::nullopt;
+    }
+    WatchResponse response = std::move(state.pending.front());
+    state.pending.pop_front();
+    return response;
+}
+
+void InMemoryMetadataStore::request_watch_progress(const WatchId id) {
+    const std::unique_lock lock(mutex_);
+    const auto iterator = watchers_.find(id);
+    if (iterator == watchers_.end()) {
+        throw StoreError(StatusCode::invalid_argument, "unknown watch ID");
+    }
+    WatchState& state = iterator->second;
+    if (state.terminal.has_value()) {
+        return;
+    }
+    if (state.pending.size() >= limits_.max_watch_pending_responses) {
+        state.pending.clear();
+        state.terminal = WatchResponse{
+            .header = ResponseHeader{.revision = revision_},
+            .id = id,
+            .status = StatusCode::quota_exceeded,
+            .cancelled = true};
+        return;
+    }
+    state.pending.push_back(WatchResponse{
+        .header = ResponseHeader{.revision = revision_},
+        .id = id});
+}
+
+WatchResponse InMemoryMetadataStore::cancel_watch(const WatchId id) {
+    const std::unique_lock lock(mutex_);
+    const auto iterator = watchers_.find(id);
+    if (iterator == watchers_.end()) {
+        throw StoreError(StatusCode::invalid_argument, "unknown watch ID");
+    }
+    watchers_.erase(iterator);
+    return {
+        .header = ResponseHeader{.revision = revision_},
+        .id = id,
+        .cancelled = true};
+}
+
+std::int64_t InMemoryMetadataStore::compact_revision() const {
+    const std::shared_lock lock(mutex_);
+    return compact_revision_;
+}
+
+std::int64_t InMemoryMetadataStore::revision() const {
+    const std::shared_lock lock(mutex_);
+    return revision_;
+}
+
+InMemoryMetadataStore::StagedWatchPublication
+InMemoryMetadataStore::stage_watch_publication_locked(
+    const std::vector<WatchEvent>& events,
+    const std::int64_t mutation_revision) const {
+    StagedWatchPublication publication{
+        .history = history_,
+        .watchers = watchers_,
+        .compact_revision = compact_revision_};
+    publication.history.push_back(EventBatch{
+        .revision = mutation_revision,
+        .events = events});
+
+    for (auto& [id, state] : publication.watchers) {
+        if (state.terminal.has_value()) {
+            continue;
+        }
+        std::vector<WatchEvent> matching;
+        for (const WatchEvent& event : events) {
+            if (watch_matches(state.request, event)) {
+                matching.push_back(event);
+            }
+        }
+        if (matching.empty() && !state.request.progress_notifications) {
+            continue;
+        }
+        if (state.pending.size()
+            >= limits_.max_watch_pending_responses) {
+            state.pending.clear();
+            state.terminal = WatchResponse{
+                .header = ResponseHeader{.revision = mutation_revision},
+                .id = id,
+                .status = StatusCode::quota_exceeded,
+                .cancelled = true};
+            continue;
+        }
+        state.pending.push_back(WatchResponse{
+            .header = ResponseHeader{.revision = mutation_revision},
+            .id = id,
+            .events = std::move(matching)});
+    }
+
+    while (publication.history.size()
+           > limits_.max_watch_history_revisions) {
+        publication.compact_revision =
+            publication.history.front().revision;
+        publication.history.pop_front();
+    }
+    return publication;
+}
+
+void InMemoryMetadataStore::commit_watch_publication_locked(
+    StagedWatchPublication& publication) noexcept {
+    history_.swap(publication.history);
+    watchers_.swap(publication.watchers);
+    compact_revision_ = publication.compact_revision;
+}
+
+bool InMemoryMetadataStore::watch_matches(
+    const WatchRequest& request,
+    const WatchEvent& event) {
+    if (request.filter == WatchFilter::exclude_put
+        && event.mutation.type == MutationEventType::put) {
+        return false;
+    }
+    if (request.filter == WatchFilter::exclude_erase
+        && event.mutation.type == MutationEventType::erase) {
+        return false;
+    }
+    const KeyValue& value = event.mutation.current.has_value()
+        ? *event.mutation.current
+        : *event.mutation.previous;
+    if (request.range.end.empty()) {
+        return value.key == request.range.start;
+    }
+    return request.range.start <= value.key
+        && value.key < request.range.end;
 }
 
 std::int64_t InMemoryMetadataStore::next_revision_locked() const {

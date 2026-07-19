@@ -11,12 +11,15 @@ Implemented now:
 - Put, erase, and modification-revision compare-and-set
 - In-memory If/Then/Else transactions with typed range, put, and delete results
 - Atomic multi-key transaction publication using one revision
+- In-process exact-key and range watches with bounded resumable event history
+- Atomic transaction watch batches, filters, progress, and cancellation
 - Synchronized concurrent access
 
 Declared but not implemented:
 
 - Historical MVCC
-- Watches and leases
+- Leases
+- Network watch streaming and persistent watch history
 - WAL, snapshots, and durable backend
 - Raft and membership
 - Network server, authentication, and metrics
