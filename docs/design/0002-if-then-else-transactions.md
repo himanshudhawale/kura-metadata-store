@@ -152,10 +152,11 @@ while preserving these semantics.
 ## Compatibility
 
 Existing point get, range, put, erase, and modification-revision CAS behavior
-is unchanged. The transaction method and typed result structures are additive.
-Scaffold transaction request types become executable only in the in-memory
-store. Lease ID remains zero-only, and no distributed-linearizability or
-durability claim is introduced.
+is unchanged. Transaction calls and typed result structures are additive for
+store callers; custom `MetadataStore` implementations must implement the new
+virtual transaction method. Scaffold transaction request types become
+executable only in the in-memory store. Lease ID remains zero-only, and no
+distributed-linearizability or durability claim is introduced.
 
 ## Test strategy
 

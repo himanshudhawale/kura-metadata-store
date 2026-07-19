@@ -104,7 +104,7 @@ the current value.
 
 ### Compare and set
 
-The first implementation provides:
+The point helper provides:
 
 ```text
 compare modRevision(key) == expected
@@ -114,7 +114,9 @@ then put(key, newValue)
 Expected revision `0` means the key must be absent. A failed comparison does not
 modify state or advance the revision.
 
-The full transaction API generalizes this into:
+### If/Then/Else transactions
+
+The in-memory transaction API generalizes compare-and-set into:
 
 ```text
 if all comparisons:
@@ -131,8 +133,38 @@ Comparison targets:
 - Value
 - Lease ID
 
-No transaction may write the same key twice. All mutations and watch events in
-one successful branch share one revision.
+All comparisons are conjunctive and observe one pre-transaction state. Missing
+keys compare as version, create revision, modification revision, and lease ID
+zero with an empty value. Numeric comparisons use signed integer ordering;
+value comparisons use unsigned lexicographic byte ordering. Every target
+supports equal, not-equal, greater, and less.
+
+Exactly one branch executes. The selected branch supports `RangeRequest`,
+`PutRequest`, and `DeleteRequest`; nested transactions are not representable.
+The complete selected branch is validated before any mutation. The unselected
+branch is not validated or executed.
+
+No selected branch may write the same possible key twice. This rejects
+duplicate puts, overlapping delete ranges, and put/delete overlap even when a
+delete would currently find no key.
+
+Selected operations execute in order. A range sees writes from earlier
+operations in its branch. Results preserve request order and are typed as
+`RangeRead`, `PutResult`, or `DeleteRangeResult`. A zero range limit means
+unlimited. Historical range revisions and nonzero put lease IDs are rejected
+because historical MVCC and leases are not implemented.
+
+If at least one put or effective delete occurs, the store revision advances
+exactly once and every mutation uses it. Read-only branches and branches whose
+deletes are all no-ops do not advance revision. Validation and signed 64-bit
+counter overflow fail atomically without changing state.
+
+The exclusive in-memory transaction boundary makes concurrent comparisons,
+branch execution, and publication atomic within one process. It does not claim
+cross-node linearizability, durability, watch delivery, or lease behavior.
+
+Design and edge cases are documented in
+[Design 0002: In-memory If/Then/Else Transactions](design/0002-if-then-else-transactions.md).
 
 ## 5. Watch
 
