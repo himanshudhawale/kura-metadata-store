@@ -16,12 +16,15 @@ Implemented now:
 - In-memory lease grant, keepalive, TTL, revoke, expiry, and key attachment
 - Atomic lease cascade deletion and transaction lease fencing
 - Synchronized concurrent access
+- Dependency-free CRC32C, segmented WAL, and atomic snapshot storage boundary
+- Synchronized WAL append, strict prefix recovery, snapshot integrity
+  discovery, and snapshot-covered conservative segment deletion
 
 Declared but not implemented:
 
 - Historical MVCC
 - Network watch streaming and persistent watch history
-- WAL, snapshots, and durable backend
+- Transactional durable KV backend and state-machine persistence integration
 - Raft and membership
 - Network server, authentication, and metrics
 - Remote client and Kura helper

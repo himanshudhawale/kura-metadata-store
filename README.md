@@ -11,8 +11,10 @@ explicit memory ownership, efficient binary protocols, and direct control over
 WAL, networking, and state-machine execution.
 
 > **Current status:** Phase 1 is a single-node, in-memory deterministic state
-> machine. It is not distributed, replicated, durable, or highly available.
-> Do not use it for production metadata.
+> machine. A Phase 3 WAL/snapshot storage boundary exists but is not connected
+> to mutation responses or a transactional backend. The service is not
+> distributed, replicated, durably integrated, or highly available. Do not use
+> it for production metadata.
 
 ## Why build it?
 
@@ -98,6 +100,9 @@ snapshot becomes current. See [Kura integration](docs/kura-integration.md).
 - [ADR-0001: phase claims](docs/decisions/0001-phase-claims.md)
 - [ADR-0002: C++23 implementation](docs/decisions/0002-cpp23-implementation.md)
 - [ADR-0003: internal Raft implementation](docs/decisions/0003-internal-raft.md)
+- [Durable WAL and snapshot design](docs/design/0005-durable-wal-snapshots.md)
+- [WAL format v1](docs/formats/wal-v1.md)
+- [Snapshot format v1](docs/formats/snapshot-v1.md)
 
 ## Build
 

@@ -23,6 +23,7 @@ find_package(Threads REQUIRED)
 add_library(
     kura_metadata
     src/byte_sequence.cpp
+    src/durable_storage.cpp
     src/key_range.cpp
     src/in_memory_metadata_store.cpp)
 
@@ -67,4 +68,20 @@ if(BUILD_TESTING)
     endif()
 
     add_test(NAME kura_metadata_tests COMMAND kura_metadata_tests)
+
+    add_executable(
+        kura_durable_storage_tests
+        tests/durable_storage_test.cpp)
+
+    target_link_libraries(kura_durable_storage_tests PRIVATE kura_metadata)
+
+    if(MSVC)
+        target_compile_options(kura_durable_storage_tests PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(kura_durable_storage_tests PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+
+    add_test(
+        NAME kura_durable_storage_tests
+        COMMAND kura_durable_storage_tests)
 endif()
