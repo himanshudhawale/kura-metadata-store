@@ -4,6 +4,8 @@
 #include "kura/metadata/kv/operation_result.hpp"
 #include "kura/metadata/kv/transaction_request.hpp"
 #include "kura/metadata/kv/transaction_result.hpp"
+#include "kura/metadata/lease/lease_request.hpp"
+#include "kura/metadata/lease/lease_response.hpp"
 
 #include <cstdint>
 
@@ -32,6 +34,21 @@ public:
 
     [[nodiscard]] virtual TransactionResult transaction(
         const TransactionRequest& request) = 0;
+
+    [[nodiscard]] virtual LeaseGrantResult grant_lease(
+        const LeaseGrantRequest& request) = 0;
+
+    [[nodiscard]] virtual LeaseLookupResult keep_alive(
+        const LeaseKeepAliveRequest& request) = 0;
+
+    [[nodiscard]] virtual LeaseLookupResult time_to_live(
+        const LeaseTimeToLiveRequest& request) const = 0;
+
+    [[nodiscard]] virtual LeaseCleanupResult revoke_lease(
+        const LeaseRevokeRequest& request) = 0;
+
+    [[nodiscard]] virtual LeaseCleanupResult expire_leases(
+        LeaseTick tick) = 0;
 
     [[nodiscard]] virtual std::int64_t revision() const = 0;
 };
