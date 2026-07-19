@@ -22,6 +22,8 @@ Implemented now:
   discovery, and snapshot-covered conservative segment deletion
 - Executable Raft Figure 2 rule catalog, typed deterministic transitions,
   ordered persistence/network/apply effects, and state-invariant validation
+- Atomic, checksummed Raft term/vote storage with explicit durable-completion
+  events and deterministic write-boundary fault injection
 
 Declared but not implemented:
 

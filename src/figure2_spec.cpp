@@ -1,6 +1,7 @@
 #include "kura/metadata/raft/figure2_spec.hpp"
 
 #include <algorithm>
+#include <iterator>
 #include <limits>
 #include <stdexcept>
 #include <type_traits>
@@ -13,7 +14,7 @@ const std::vector<RuleDescriptor> rule_catalog{
     {RuleId::observe_higher_term, "observe higher term", "all servers",
      "An incoming RPC request or response has term > currentTerm.",
      "Set currentTerm, clear votedFor, become follower, and clear candidate/leader volatile state.",
-     "PersistState(currentTerm, votedFor) precedes all processing of the RPC.",
+     "PersistRaftHardState(currentTerm, votedFor) blocks further processing.",
      "The new term and empty vote reach stable storage before any response or new-term activity."},
     {RuleId::apply_committed, "apply committed entry", "all servers",
      "commitIndex > lastApplied.",
@@ -33,7 +34,7 @@ const std::vector<RuleDescriptor> rule_catalog{
     {RuleId::request_vote_grant, "grant RequestVote", "RPC receiver",
      "Term is current; votedFor is empty or candidate; candidate log is at least as up-to-date.",
      "Set votedFor to candidate.",
-     "PersistState(votedFor), ResetElectionTimer, then granted response.",
+     "PersistRaftHardState(term, vote); completion releases timer reset and granted response.",
      "The vote reaches stable storage before the granted response."},
     {RuleId::request_vote_deny, "deny RequestVote", "RPC receiver",
      "Term is current, but prior vote or log freshness condition fails.",
@@ -63,7 +64,7 @@ const std::vector<RuleDescriptor> rule_catalog{
     {RuleId::candidate_start_election, "start election", "candidate",
      "Follower timeout or explicit candidate election start.",
      "Increment term, vote for self, retain only self vote, clear known leader.",
-     "PersistState(currentTerm,votedFor), ResetElectionTimer, then RequestVote to every peer.",
+     "PersistRaftHardState(term,self); completion releases timer reset and RequestVote sends.",
      "Term and self-vote reach stable storage before any election RPC."},
     {RuleId::candidate_restart_election, "restart election", "candidate",
      "Election timeout while candidate.",
@@ -151,6 +152,47 @@ void ensure_valid(const State& state, const std::string_view when) {
     }
 }
 
+RaftHardState hard_state(const State& state) {
+    return {
+        .current_term = state.persistent.current_term,
+        .voted_for = state.persistent.voted_for};
+}
+
+void persist_hard_state(StepResult& result) {
+    if (result.state.next_hard_state_request_id == 0
+        || result.state.next_hard_state_request_id
+            == std::numeric_limits<std::uint64_t>::max()) {
+        throw std::overflow_error("Raft hard-state request ID exhausted");
+    }
+    result.effects.push_back(PersistRaftHardState{
+        .request_id = result.state.next_hard_state_request_id++,
+        .state = hard_state(result.state)});
+}
+
+void gate_on_hard_state(StepResult& result) {
+    const auto persistence = std::ranges::find_if(
+        result.effects,
+        [](const Effect& effect) {
+            return std::holds_alternative<PersistRaftHardState>(effect);
+        });
+    if (persistence == result.effects.end()) {
+        return;
+    }
+    if (result.state.pending_hard_state) {
+        throw std::logic_error("Raft hard-state persistence is already pending");
+    }
+    const auto request = std::get<PersistRaftHardState>(*persistence);
+    auto after = persistence;
+    ++after;
+    std::vector<Effect> deferred(
+        std::make_move_iterator(after),
+        std::make_move_iterator(result.effects.end()));
+    result.effects.erase(after, result.effects.end());
+    result.state.pending_hard_state = PendingHardStatePersistence{
+        .request = request,
+        .deferred_effects = std::move(deferred)};
+}
+
 AppendEntriesRequest append_request(const State& state, const NodeId peer) {
     const auto& progress = state.leader->progress.at(peer);
     const auto previous = progress.next_index.value - 1;
@@ -208,8 +250,7 @@ void start_election(StepResult& result) {
     result.state.leader.reset();
     result.state.votes_received = {result.state.node};
     result.rules.push_back(RuleId::candidate_start_election);
-    result.effects.push_back(PersistState{
-        {PersistentField::current_term, PersistentField::voted_for}});
+    persist_hard_state(result);
     result.effects.push_back(ResetElectionTimer{});
     for (const auto peer : result.state.peers) {
         result.effects.push_back(SendRequestVote{
@@ -251,8 +292,7 @@ void observe_higher_term(StepResult& result, const Rpc& rpc) {
         result.state.votes_received.clear();
         result.state.leader.reset();
         result.rules.push_back(RuleId::observe_higher_term);
-        result.effects.push_back(PersistState{
-            {PersistentField::current_term, PersistentField::voted_for}});
+        persist_hard_state(result);
     }
 }
 
@@ -279,8 +319,7 @@ void handle_request_vote(StepResult& result, const ReceiveRequestVote& event) {
         result.state.persistent.voted_for = event.request.candidate;
         result.rules.push_back(RuleId::request_vote_grant);
         if (changed) {
-            result.effects.push_back(
-                PersistState{{PersistentField::voted_for}});
+            persist_hard_state(result);
         }
         result.effects.push_back(ResetElectionTimer{});
         result.effects.push_back(SendRequestVoteResponse{
@@ -566,6 +605,13 @@ std::vector<InvariantViolation> validate(const State& state) {
     if (state.role != RaftRole::candidate && !state.votes_received.empty()) {
         violations.push_back({"non-candidate retains received votes"});
     }
+    if (state.next_hard_state_request_id == 0) {
+        violations.push_back({"next hard-state request ID is zero"});
+    }
+    if (state.pending_hard_state
+        && state.pending_hard_state->request.request_id == 0) {
+        violations.push_back({"pending hard-state request ID is zero"});
+    }
     for (const auto voter : state.votes_received) {
         if (voter != state.node && !peers.contains(voter)) {
             violations.push_back({"candidate has a vote from a non-peer"});
@@ -612,6 +658,16 @@ bool is_log_at_least_as_up_to_date(
 
 StepResult step(const State& state, const Event& event) {
     ensure_valid(state, "invalid pre-state");
+    const bool is_completion =
+        std::holds_alternative<RaftHardStatePersisted>(event);
+    if (state.pending_hard_state && !is_completion) {
+        throw std::logic_error(
+            "Raft core input is blocked on hard-state persistence");
+    }
+    if (!state.pending_hard_state && is_completion) {
+        throw std::invalid_argument(
+            "unexpected Raft hard-state persistence completion");
+    }
     StepResult result{.state = state};
     std::visit(
         [&result](const auto& concrete) {
@@ -641,9 +697,21 @@ StepResult step(const State& state, const Event& event) {
             } else if constexpr (
                 std::is_same_v<Concrete, ReceiveClientCommand>) {
                 handle_client(result, concrete);
+            } else if constexpr (
+                std::is_same_v<Concrete, RaftHardStatePersisted>) {
+                const auto pending =
+                    std::move(*result.state.pending_hard_state);
+                if (concrete.request_id != pending.request.request_id
+                    || concrete.state != pending.request.state) {
+                    throw std::invalid_argument(
+                        "Raft hard-state completion does not match pending request");
+                }
+                result.state.pending_hard_state.reset();
+                result.effects = std::move(pending.deferred_effects);
             }
         },
         event);
+    gate_on_hard_state(result);
     ensure_valid(result.state, "invalid post-state");
     return result;
 }

@@ -16,6 +16,13 @@ leader change.
 A follower that acknowledges an entry it has not durably stored can lose the
 entry on restart while the leader counted it toward quorum.
 
+## Responding before hard-state persistence
+
+A node that grants a vote or accepts a higher term before durably storing
+`currentTerm` and `votedFor` can restart in the old state and vote twice. Hold
+the peer response until the matching hard-state completion event enters the
+Raft core.
+
 ## Serving a stale leader read
 
 Leadership belief is not proof of current leadership. Linearizable reads require

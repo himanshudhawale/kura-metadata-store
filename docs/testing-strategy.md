@@ -6,10 +6,12 @@
 - Model tests compare optimized state machines with a simple reference model.
 - Property tests generate command sequences and validate invariants.
 - Recovery tests interrupt every WAL and snapshot write boundary.
+- Raft hard-state tests interrupt every create/write/sync/close/replace/
+  directory-sync boundary and truncate or corrupt every record byte.
 - Concurrency tests exercise CAS, watch registration, lease expiry, and apply.
 - Simulation tests control time, messages, partitions, and node crashes.
-- Figure 2 catalog tests execute every rule and assert persistence-before-send
-  effect ordering.
+- Figure 2 catalog tests execute every rule and assert hard-state completion
+  correlation plus persistence-before-send ordering.
 - Linearizability tests analyze complete concurrent client histories.
 - Compatibility tests read every supported durable and protocol version.
 

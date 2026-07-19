@@ -25,6 +25,16 @@ void expect(const bool condition, const std::string& message) {
     }
 }
 
+template <typename Exception, typename Operation>
+void expect_throws(Operation&& operation, const std::string& message) {
+    try {
+        std::forward<Operation>(operation)();
+    } catch (const Exception&) {
+        return;
+    }
+    throw TestFailure(message);
+}
+
 template <typename EffectType>
 std::size_t effect_position(const StepResult& result) {
     const auto found = std::ranges::find_if(
@@ -40,6 +50,18 @@ std::size_t effect_position(const StepResult& result) {
 
 void record(const StepResult& result) {
     exercised_rules.insert(result.rules.begin(), result.rules.end());
+}
+
+StepResult complete_hard_state(StepResult result) {
+    while (result.state.pending_hard_state) {
+        const auto request = result.state.pending_hard_state->request;
+        result = step(
+            result.state,
+            RaftHardStatePersisted{
+                .request_id = request.request_id,
+                .state = request.state});
+    }
+    return result;
 }
 
 CommandEnvelope command(const std::uint64_t sequence) {
@@ -114,7 +136,8 @@ void request_vote_rules_and_persistence_order() {
         result.rules == std::vector{RuleId::request_vote_reject_stale},
         "stale vote request is rejected without term change");
     expect(
-        effect_position<PersistState>(result) == result.effects.size(),
+        effect_position<PersistRaftHardState>(result)
+            == result.effects.size(),
         "stale vote rejection does not persist unchanged state");
 
     result = step(state, ReceiveRequestVote{
@@ -126,9 +149,15 @@ void request_vote_rules_and_persistence_order() {
             && !result.state.persistent.voted_for,
         "higher term is adopted but stale-log candidate is denied");
     expect(
-        effect_position<PersistState>(result)
-            < effect_position<SendRequestVoteResponse>(result),
-        "higher term persists before vote denial");
+        effect_position<PersistRaftHardState>(result) == 0
+            && effect_position<SendRequestVoteResponse>(result)
+                == result.effects.size(),
+        "higher-term vote denial is withheld for durable completion");
+    result = complete_hard_state(std::move(result));
+    expect(
+        effect_position<SendRequestVoteResponse>(result)
+            < result.effects.size(),
+        "durable completion releases the higher-term vote denial");
 
     result = step(state, ReceiveRequestVote{
                              .from = {2},
@@ -138,9 +167,17 @@ void request_vote_rules_and_persistence_order() {
         result.state.persistent.voted_for == NodeId{2},
         "fresh higher-term candidate receives the vote");
     expect(
-        effect_position<PersistState>(result)
-            < effect_position<SendRequestVoteResponse>(result),
-        "term/vote persistence precedes granted response");
+        effect_position<PersistRaftHardState>(result) == 0
+            && effect_position<SendRequestVoteResponse>(result)
+                == result.effects.size(),
+        "granted vote is withheld for durable completion");
+    result = complete_hard_state(std::move(result));
+    expect(
+        effect_position<SendRequestVoteResponse>(result)
+            < result.effects.size()
+            && std::get<SendRequestVoteResponse>(result.effects.back())
+                .response.granted,
+        "durable completion releases the granted vote");
 
     state.persistent.voted_for = NodeId{3};
     result = step(state, ReceiveRequestVote{
@@ -152,6 +189,40 @@ void request_vote_rules_and_persistence_order() {
                 .response.granted
             == false,
         "one vote per term is enforced");
+}
+
+void hard_state_completion_is_an_explicit_input() {
+    auto result = step(follower(), ElectionTimeout{});
+    expect(result.state.pending_hard_state.has_value(), "hard state is not pending");
+    const auto pending = result.state.pending_hard_state->request;
+    expect(
+        std::get<PersistRaftHardState>(result.effects.front()) == pending,
+        "persist effect and pending request differ");
+    expect_throws<std::logic_error>(
+        [&] {
+            static_cast<void>(step(result.state, HeartbeatTimeout{}));
+        },
+        "the core accepted input before durable completion");
+    expect_throws<std::invalid_argument>(
+        [&] {
+            static_cast<void>(step(
+                result.state,
+                RaftHardStatePersisted{
+                    .request_id = pending.request_id + 1,
+                    .state = pending.state}));
+        },
+        "a mismatched durable completion was accepted");
+
+    result = step(
+        result.state,
+        RaftHardStatePersisted{
+            .request_id = pending.request_id,
+            .state = pending.state});
+    expect(
+        !result.state.pending_hard_state
+            && effect_position<SendRequestVote>(result)
+                < result.effects.size(),
+        "matching durable completion did not release deferred effects");
 }
 
 void append_entries_rules_and_persistence_order() {
@@ -232,15 +303,21 @@ State elect_leader() {
             && result.state.persistent.voted_for == NodeId{1},
         "follower timeout starts a persisted self-vote election");
     expect(
-        effect_position<PersistState>(result)
-            < effect_position<SendRequestVote>(result),
-        "election persistence precedes vote requests");
+        effect_position<PersistRaftHardState>(result) == 0
+            && effect_position<SendRequestVote>(result)
+                == result.effects.size(),
+        "vote requests are withheld for durable election persistence");
+    result = complete_hard_state(std::move(result));
+    expect(
+        effect_position<SendRequestVote>(result) < result.effects.size(),
+        "durable completion releases vote requests");
 
     auto restarted = step(result.state, ElectionTimeout{});
     record(restarted);
     expect(
         restarted.state.persistent.current_term == Term{2},
         "candidate timeout starts a higher-term election");
+    restarted = complete_hard_state(std::move(restarted));
 
     result = step(result.state, ReceiveRequestVoteResponse{
                                     .from = {2},
@@ -313,8 +390,9 @@ void leader_replication_commit_and_apply_rules() {
     expect(
         result.state.role == RaftRole::follower
             && result.state.persistent.current_term == Term{2}
-            && effect_position<PersistState>(result) == 0,
-        "higher response term persists and forces leader to follower");
+            && effect_position<PersistRaftHardState>(result) == 0
+            && result.state.pending_hard_state,
+        "higher response term requires an explicit persistence completion");
 }
 
 void leader_does_not_directly_commit_an_old_term_entry() {
@@ -322,6 +400,7 @@ void leader_does_not_directly_commit_an_old_term_entry() {
         follower(1, {entry(1, 1)}),
         ElectionTimeout{});
     record(election);
+    election = complete_hard_state(std::move(election));
     auto result = step(
         election.state,
         ReceiveRequestVoteResponse{
@@ -364,6 +443,7 @@ int main() {
     try {
         catalog_and_invariants_are_executable();
         request_vote_rules_and_persistence_order();
+        hard_state_completion_is_an_explicit_input();
         append_entries_rules_and_persistence_order();
         leader_replication_commit_and_apply_rules();
         leader_does_not_directly_commit_an_old_term_entry();

@@ -1,4 +1,4 @@
-# Design 0006: Executable Raft Figure 2 specification
+# Design 0007: Executable Raft Figure 2 specification
 
 ## Status and scope
 
@@ -45,18 +45,24 @@ sentinels. Snapshot offsets will require a separately reviewed extension.
 ### Events, transitions, and effects
 
 `Event` is a closed `std::variant` of logical timeouts, RPC requests and
-responses, client commands, and one-entry apply opportunities. `step(old,
-event)` copies the input and returns:
+responses, hard-state persistence completions, client commands, and one-entry
+apply opportunities. `step(old, event)` copies the input and returns:
 
 1. the next state;
 2. every `RuleId` that fired, in order;
 3. ordered typed `Effect` values.
 
 The core reads no clock and performs no network, disk, or state-machine I/O.
-An adapter must process effects from left to right. `PersistState` is a
-completion barrier: all named fields must reach stable storage before the next
-effect is started. Thus a granted vote, successful append reply, election RPC,
-or replication RPC can never overtake its required durable update.
+For `currentTerm`/`votedFor`, it emits `PersistRaftHardState`, records the
+request and remaining effects as pending, and accepts no other input until the
+matching `RaftHardStatePersisted` event arrives. Only that explicit input
+releases a granted vote, higher-term response, or election RPC. Mismatched and
+unsolicited completions are rejected.
+
+`PersistState(log)` remains an ordered adapter barrier for the separately
+versioned WAL: all named log fields must reach stable storage before the next
+effect is started. Thus successful append replies and replication RPCs cannot
+overtake their required log update.
 
 `ApplyCommitted` advances exactly one index and emits `ApplyCommand`. A pending
 leader client receives `CompleteClientCommand` only after that apply effect.
@@ -94,17 +100,17 @@ any catalog `RuleId` was not observed.
 
 | Figure 2 rule / `RuleId` | Transition types and effects | Deterministic scenario |
 |---|---|---|
-| All: higher RPC term / `observe_higher_term` | all four `Receive*` RPC events; `PersistState(term,vote)` | higher RequestVote and higher leader response force follower |
+| All: higher RPC term / `observe_higher_term` | all four `Receive*` RPC events; `PersistRaftHardState`, then matching completion | higher RequestVote and higher leader response force follower |
 | All: apply committed / `apply_committed` | `ApplyCommitted`; `ApplyCommand`, optional `CompleteClientCommand` | committed leader entry applies before client completion |
 | Follower: election timeout / `follower_election_timeout` | `ElectionTimeout` | follower timeout enters candidate |
 | RequestVote: stale term / `request_vote_reject_stale` | `ReceiveRequestVote`; negative response | term 1 request at term 2 |
-| RequestVote: grant / `request_vote_grant` | vote mutation; persist, timer reset, positive response | fresher higher-term candidate |
+| RequestVote: grant / `request_vote_grant` | vote mutation; hard-state request, completion, timer reset, positive response | fresher higher-term candidate |
 | RequestVote: deny / `request_vote_deny` | negative response | stale log and already-voted cases |
 | AppendEntries: stale term / `append_entries_reject_stale` | `ReceiveAppendEntries`; negative response | term 2 leader at term 3 |
 | AppendEntries: missing/mismatched previous entry / `append_entries_reject_log_mismatch` | negative response | wrong `prevLogTerm` |
 | AppendEntries: conflict/delete/append / `append_entries_accept` | log mutation; persist before success | term-2 suffix replaced by term-3 suffix |
 | AppendEntries: follower commit / `append_entries_advance_commit` | volatile commit-index update | `leaderCommit=3` after accepted append |
-| Candidate: start election / `candidate_start_election` | term/self-vote; persist before RequestVote sends | first follower timeout |
+| Candidate: start election / `candidate_start_election` | term/self-vote; completion before RequestVote sends | first follower timeout |
 | Candidate: restart election / `candidate_restart_election` | `ElectionTimeout` in candidate | second timeout increments term |
 | Candidate: majority / `candidate_win_election` | granted `ReceiveRequestVoteResponse` | self plus peer vote in three-node cluster |
 | Candidate: valid AppendEntries / `candidate_accept_append_entries` | role/leader update then append receiver rules | current-term heartbeat makes candidate follower |
@@ -154,14 +160,18 @@ rules and must not be inferred from this specification.
   makes crash-boundary ordering untestable.
 - **One monolithic “persist everything” effect:** rejected because named fields
   make the durability obligation reviewable and minimize future writes.
+- **A synchronous term/vote barrier:** replaced by an explicit completion
+  input so a simulator or production event loop can crash or delay persistence
+  without accidentally releasing a success response.
 
 ## Validation
 
 `kura_figure2_spec_tests` checks the catalog schema, invariant failures, term
 and freshness comparisons, every receiver branch, conflict replacement,
 candidate transitions, leader progress, majority commitment, apply/client
-ordering, and the relative positions of persistence and send effects. It also
-proves every current catalog row has an observed deterministic scenario.
+ordering, blocked input while hard state is pending, completion correlation,
+and the relative positions of persistence and send effects. It also proves
+every current catalog row has an observed deterministic scenario.
 
 The existing state-machine and durable-storage suites remain unchanged and are
 run with the new suite through CTest.
