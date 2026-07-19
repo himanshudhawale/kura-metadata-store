@@ -20,6 +20,9 @@
 - Commit/apply tests execute quorum thresholds, minority partitions, old-term
   traps, follower bounds, ordered completion, backpressure, client
   correlation, and applied-state recovery.
+- ReadIndex tests execute current-term preconditions, contextual quorum
+  confirmation, delayed apply, replay rejection, bounds, cancellation,
+  timeout, leadership loss, and former-leader partitions.
 - Linearizability tests analyze complete concurrent client histories.
 - Compatibility tests read every supported durable and protocol version.
 
@@ -45,5 +48,5 @@ to `Simulator::replay`.
 
 The deterministic probe validates scheduling and every fault control. The
 Raft adapter additionally validates RequestVote, AppendEntries, majority
-commit, and ordered application. This is not evidence that ReadIndex,
-snapshots, or a distributed service is implemented.
+commit, ordered application, and ReadIndex. This is not evidence that
+snapshots or a distributed service is implemented.

@@ -199,4 +199,20 @@ if(BUILD_TESTING)
     add_test(
         NAME kura_raft_commit_apply_tests
         COMMAND kura_raft_commit_apply_tests)
+
+    add_executable(
+        kura_raft_read_index_tests
+        tests/raft_read_index_test.cpp)
+
+    target_link_libraries(kura_raft_read_index_tests PRIVATE kura_metadata)
+
+    if(MSVC)
+        target_compile_options(kura_raft_read_index_tests PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(kura_raft_read_index_tests PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+
+    add_test(
+        NAME kura_raft_read_index_tests
+        COMMAND kura_raft_read_index_tests)
 endif()

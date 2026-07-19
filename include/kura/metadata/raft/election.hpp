@@ -9,6 +9,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <variant>
 #include <vector>
 
@@ -39,7 +40,10 @@ using Input = std::variant<
     RaftLogPersisted,
     LogEntryApplied,
     LogEntryApplyFailed,
-    RetryApplication>;
+    RetryApplication,
+    ReadIndexRequest,
+    CancelReadIndex,
+    TimeoutReadIndex>;
 
 struct ResetElectionDeadline {
     simulation::TimerId timer_id{};
@@ -76,6 +80,8 @@ using Effect = std::variant<
     ApplyLogEntry,
     ApplicationBackpressured,
     figure2::CompleteClientCommand,
+    ReadIndexResponse,
+    ReadIndexRejected,
     ResetElectionDeadline,
     CancelElectionDeadline,
     ResetHeartbeatDeadline,
@@ -99,6 +105,9 @@ struct Snapshot {
     LogIndex last_applied;
     bool application_pending{};
     bool application_blocked{};
+    std::size_t pending_read_count{};
+    std::uint64_t completed_read_count{};
+    std::uint64_t rejected_read_count{};
     bool waiting_for_persistence{};
 };
 
@@ -112,7 +121,9 @@ public:
         TimeoutRange timeouts = {},
         std::vector<LogEntry> recovered_log = {},
         simulation::LogicalTime heartbeat_interval = 2,
-        LogIndex recovered_applied = {});
+        LogIndex recovered_applied = {},
+        std::size_t max_pending_reads = 128,
+        std::size_t max_read_history = 4'096);
 
     [[nodiscard]] StepResult start();
     [[nodiscard]] StepResult step(const Input& input);
@@ -131,6 +142,16 @@ private:
     [[nodiscard]] ResetHeartbeatDeadline next_heartbeat();
     void gate_log_persistence(StepResult& result);
     void schedule_application(StepResult& result);
+    void acknowledge_read(
+        const figure2::ReceiveAppendEntriesResponse& response,
+        StepResult& result);
+    void complete_ready_reads(StepResult& result);
+    void reject_pending_reads(
+        ReadIndexFailure reason,
+        StepResult& result);
+    [[nodiscard]] StepResult begin_read(const ReadIndexRequest& request);
+    [[nodiscard]] StepResult cancel_read(const CancelReadIndex& request);
+    [[nodiscard]] StepResult timeout_read(const TimeoutReadIndex& request);
 
     struct PendingLogPersistence {
         PersistRaftLog request;
@@ -140,6 +161,13 @@ private:
     struct PendingApplication {
         ApplyLogEntry request;
         bool blocked{};
+    };
+
+    struct PendingRead {
+        ReadIndexRequest request;
+        LogIndex read_index;
+        std::set<NodeId> acknowledgements;
+        bool quorum_confirmed{};
     };
 
     figure2::State state_;
@@ -154,6 +182,14 @@ private:
     std::optional<simulation::TimerId> heartbeat_timer_;
     std::optional<PendingLogPersistence> pending_log_;
     std::optional<PendingApplication> pending_application_;
+    std::map<ReadIndexContext, PendingRead> pending_reads_;
+    std::map<RequestId, ReadIndexContext> pending_read_requests_;
+    std::set<RequestId> used_read_requests_;
+    std::size_t max_pending_reads_{};
+    std::size_t max_read_history_{};
+    std::uint64_t next_read_context_{1};
+    std::uint64_t completed_read_count_{};
+    std::uint64_t rejected_read_count_{};
     bool started_{};
 };
 
@@ -165,6 +201,9 @@ struct SimulationConfig {
     bool mix_node_id_into_seed{true};
     simulation::LogicalTime heartbeat_interval{2};
     std::vector<CommandEnvelope> commands_on_leadership;
+    std::vector<ReadIndexRequest> reads_on_leadership;
+    std::size_t max_pending_reads{128};
+    std::size_t max_read_history{4'096};
     SimulationObserver observer;
 };
 

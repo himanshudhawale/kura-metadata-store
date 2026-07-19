@@ -347,6 +347,14 @@ Matching success/failure inputs drive `lastApplied`, backpressure, retry, and
 leader-owned client completion. Recovered applied state prevents replay of an
 already represented prefix.
 
+Slice 4 accepts leader-only `ReadIndexRequest` inputs after a current-term
+commit. It sends AppendEntries carrying a unique `ReadIndexContext`, counts
+successful current-term acknowledgements by peer, and returns the captured
+commit index only after a quorum and `lastApplied` reaches that index.
+Cancellation, timeout, capacity, replay, and leadership loss return typed
+rejections rather than stale success.
+
 Details are in [Design 0009](design/0009-raft-election-core.md),
 [Design 0011](design/0011-raft-append-entries.md), and
-[Design 0012](design/0012-raft-commit-apply.md).
+[Design 0012](design/0012-raft-commit-apply.md), and
+[Design 0013](design/0013-raft-read-index.md).

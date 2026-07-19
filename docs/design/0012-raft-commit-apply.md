@@ -11,6 +11,10 @@ recovery of represented applied state.
 It does not implement ReadIndex, snapshots, membership changes, production
 transport, or state-machine snapshot installation.
 
+ReadIndex was subsequently added by
+[Design 0013](0013-raft-read-index.md); this document retains the reviewed
+slice 3 boundary and rationale.
+
 ## Problem and why
 
 Replication is not commitment. A leader in a minority can durably copy an

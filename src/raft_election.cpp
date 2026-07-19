@@ -71,6 +71,30 @@ void encode_entry(simulation::Bytes& bytes, const LogEntry& entry) {
         entry.command.payload.end());
 }
 
+void encode_context(
+    simulation::Bytes& bytes,
+    const std::optional<ReadIndexContext> context) {
+    bytes.push_back(context ? 1 : 0);
+    append_u64(bytes, context ? context->value : 0);
+}
+
+std::optional<ReadIndexContext> decode_context(
+    const simulation::Bytes& bytes,
+    std::size_t& offset) {
+    if (offset >= bytes.size()) {
+        throw std::invalid_argument("truncated ReadIndex context");
+    }
+    const auto present = bytes[offset++];
+    const auto value = read_u64(bytes, offset);
+    if (present > 1 || (!present && value != 0)
+        || (present && value == 0)) {
+        throw std::invalid_argument("invalid ReadIndex context");
+    }
+    return present
+        ? std::optional<ReadIndexContext>{ReadIndexContext{value}}
+        : std::nullopt;
+}
+
 LogEntry decode_entry(
     const simulation::Bytes& bytes,
     std::size_t& offset) {
@@ -121,6 +145,7 @@ simulation::Bytes encode(const AppendEntriesRequest& request) {
     append_u64(bytes, request.previous_log_index.value);
     append_u64(bytes, request.previous_log_term.value);
     append_u64(bytes, request.leader_commit.value);
+    encode_context(bytes, request.read_context);
     append_u64(bytes, request.entries.size());
     for (const auto& entry : request.entries) {
         encode_entry(bytes, entry);
@@ -130,11 +155,12 @@ simulation::Bytes encode(const AppendEntriesRequest& request) {
 
 simulation::Bytes encode(const AppendEntriesResponse& response) {
     simulation::Bytes bytes;
-    bytes.reserve(18);
+    bytes.reserve(27);
     bytes.push_back(append_entries_response_tag);
     append_u64(bytes, response.term.value);
     bytes.push_back(response.succeeded ? 1 : 0);
     append_u64(bytes, response.matched_index.value);
+    encode_context(bytes, response.read_context);
     return bytes;
 }
 
@@ -265,6 +291,7 @@ DecodedMessage decode_message(
         request.previous_log_index = {read_u64(bytes, offset)};
         request.previous_log_term = {read_u64(bytes, offset)};
         request.leader_commit = {read_u64(bytes, offset)};
+        request.read_context = decode_context(bytes, offset);
         const auto count = read_u64(bytes, offset);
         if (count > (bytes.size() - offset) / 44) {
             throw std::invalid_argument("invalid AppendEntries count");
@@ -278,14 +305,16 @@ DecodedMessage decode_message(
         }
         return request;
     }
-    if (bytes.front() == append_entries_response_tag && bytes.size() == 18) {
+    if (bytes.front() == append_entries_response_tag && bytes.size() == 27) {
         const auto term = read_u64(bytes, offset);
         const auto succeeded = bytes[offset++];
         const auto matched = read_u64(bytes, offset);
+        const auto context = decode_context(bytes, offset);
         if (succeeded > 1) {
             throw std::invalid_argument("invalid AppendEntries response");
         }
-        return AppendEntriesResponse{{term}, succeeded != 0, {matched}};
+        return AppendEntriesResponse{
+            {term}, succeeded != 0, {matched}, context};
     }
     throw std::invalid_argument("unknown Raft election message");
 }
@@ -367,6 +396,22 @@ public:
                 std::make_move_iterator(proposal.begin()),
                 std::make_move_iterator(proposal.end()));
         }
+        const auto snapshot = core_->snapshot();
+        const bool current_term_committed =
+            snapshot.commit_index != LogIndex{}
+            && snapshot.log.at(snapshot.commit_index.value - 1).term
+                == snapshot.hard_state.current_term;
+        if (snapshot.role == RaftRole::leader
+            && !snapshot.waiting_for_persistence
+            && current_term_committed
+            && next_read_request_ < config_.reads_on_leadership.size()) {
+            auto read = translate(core_->step(
+                config_.reads_on_leadership[next_read_request_++]));
+            actions.insert(
+                actions.end(),
+                std::make_move_iterator(read.begin()),
+                std::make_move_iterator(read.end()));
+        }
         observe();
         return actions;
     }
@@ -413,7 +458,9 @@ private:
             config_.timeouts,
             std::move(recovered_log),
             config_.heartbeat_interval,
-            recovered_applied);
+            recovered_applied,
+            config_.max_pending_reads,
+            config_.max_read_history);
         auto actions = translate(core_->start());
         observe();
         return actions;
@@ -563,6 +610,7 @@ private:
     std::optional<Core> core_;
     std::vector<simulation::NodeEvent> queued_;
     std::size_t next_leader_command_{};
+    std::size_t next_read_request_{};
 };
 
 }  // namespace
@@ -575,7 +623,9 @@ Core::Core(
     const TimeoutRange timeouts,
     std::vector<LogEntry> recovered_log,
     const simulation::LogicalTime heartbeat_interval,
-    const LogIndex recovered_applied)
+    const LogIndex recovered_applied,
+    const std::size_t max_pending_reads,
+    const std::size_t max_read_history)
     : state_{
           .node = self,
           .peers = std::move(peers),
@@ -588,7 +638,9 @@ Core::Core(
               .last_applied = recovered_applied}},
       timeouts_(timeouts),
       heartbeat_interval_(heartbeat_interval),
-      random_state_(seed) {
+      random_state_(seed),
+      max_pending_reads_(max_pending_reads),
+      max_read_history_(max_read_history) {
     if (self.value == 0) {
         throw std::invalid_argument("Raft node ID must be nonzero");
     }
@@ -609,6 +661,9 @@ Core::Core(
     }
     if (heartbeat_interval_ == 0) {
         throw std::invalid_argument("Raft heartbeat interval must be nonzero");
+    }
+    if (max_pending_reads_ == 0 || max_read_history_ < max_pending_reads_) {
+        throw std::invalid_argument("invalid ReadIndex limits");
     }
     if (recovered.current_term == Term{} && recovered.voted_for) {
         throw std::invalid_argument("bootstrap term cannot contain a vote");
@@ -668,6 +723,7 @@ StepResult Core::step(const Input& input) {
             completed.effects.emplace_back(
                 figure2::CompleteClientCommand{applied->index});
         }
+        complete_ready_reads(completed);
         schedule_application(completed);
         return completed;
     }
@@ -720,9 +776,27 @@ StepResult Core::step(const Input& input) {
         throw std::logic_error(
             "Raft core input is blocked on log persistence");
     }
+    if (const auto* read = std::get_if<ReadIndexRequest>(&input)) {
+        return begin_read(*read);
+    }
+    if (const auto* cancel = std::get_if<CancelReadIndex>(&input)) {
+        return cancel_read(*cancel);
+    }
+    if (const auto* timeout = std::get_if<TimeoutReadIndex>(&input)) {
+        return timeout_read(*timeout);
+    }
     if (const auto* append =
             std::get_if<figure2::ReceiveAppendEntries>(&input)) {
         validate_append_request(append->request);
+    }
+    if (const auto* response =
+            std::get_if<figure2::ReceiveAppendEntriesResponse>(&input)) {
+        const auto previous = state_.role;
+        auto result = translate(
+            figure2::step(state_, *response),
+            previous);
+        acknowledge_read(*response, result);
+        return result;
     }
     if (const auto* deadline = std::get_if<ElectionDeadline>(&input)) {
         if (!election_timer_ || deadline->timer_id != *election_timer_) {
@@ -757,7 +831,13 @@ StepResult Core::step(const Input& input) {
                 || std::is_same_v<Typed, RaftLogPersisted>
                 || std::is_same_v<Typed, LogEntryApplied>
                 || std::is_same_v<Typed, LogEntryApplyFailed>
-                || std::is_same_v<Typed, RetryApplication>) {
+                || std::is_same_v<Typed, RetryApplication>
+                || std::is_same_v<Typed, ReadIndexRequest>
+                || std::is_same_v<Typed, CancelReadIndex>
+                || std::is_same_v<Typed, TimeoutReadIndex>
+                || std::is_same_v<
+                    Typed,
+                    figure2::ReceiveAppendEntriesResponse>) {
                 return {};
             } else {
                 return translate(
@@ -791,6 +871,9 @@ Snapshot Core::snapshot() const {
         .application_pending = pending_application_.has_value(),
         .application_blocked =
             pending_application_ && pending_application_->blocked,
+        .pending_read_count = pending_reads_.size(),
+        .completed_read_count = completed_read_count_,
+        .rejected_read_count = rejected_read_count_,
         .waiting_for_persistence =
             state_.pending_hard_state.has_value() || pending_log_.has_value()};
 }
@@ -840,8 +923,12 @@ StepResult Core::translate(
             if (!resets_election) {
                 translated.effects.emplace_back(next_deadline());
             }
+            reject_pending_reads(
+                ReadIndexFailure::leadership_lost,
+                translated);
         }
     }
+
     for (auto& effect : result.effects) {
         std::visit(
             [this, &translated](auto&& typed) {
@@ -880,6 +967,146 @@ StepResult Core::translate(
         schedule_application(translated);
     }
     return translated;
+}
+
+StepResult Core::begin_read(const ReadIndexRequest& request) {
+    auto reject = [this, &request](const ReadIndexFailure reason) {
+        ++rejected_read_count_;
+        return StepResult{
+            .effects = {
+                ReadIndexRejected{request.request_id, reason}}};
+    };
+    if (request.request_id == RequestId{}) {
+        throw std::invalid_argument(
+            "ReadIndex request ID must be nonzero");
+    }
+    if (state_.role != RaftRole::leader) {
+        return reject(ReadIndexFailure::not_leader);
+    }
+    if (used_read_requests_.contains(request.request_id)) {
+        return reject(ReadIndexFailure::duplicate_request);
+    }
+    const auto commit = state_.volatile_state.commit_index;
+    if (commit == LogIndex{}
+        || state_.persistent.log.at(commit.value - 1).term
+            != state_.persistent.current_term) {
+        return reject(ReadIndexFailure::current_term_not_committed);
+    }
+    if (pending_reads_.size() >= max_pending_reads_
+        || used_read_requests_.size() >= max_read_history_) {
+        return reject(ReadIndexFailure::capacity_exceeded);
+    }
+    if (next_read_context_ == 0
+        || next_read_context_
+            == std::numeric_limits<std::uint64_t>::max()) {
+        return reject(ReadIndexFailure::context_exhausted);
+    }
+
+    const ReadIndexContext context{next_read_context_++};
+    used_read_requests_.insert(request.request_id);
+    pending_read_requests_.emplace(request.request_id, context);
+    pending_reads_.emplace(
+        context,
+        PendingRead{
+            .request = request,
+            .read_index = commit,
+            .acknowledgements = {state_.node}});
+
+    auto result = translate(
+        figure2::step(state_, figure2::HeartbeatTimeout{}),
+        state_.role);
+    for (auto& effect : result.effects) {
+        if (auto* send = std::get_if<figure2::SendAppendEntries>(&effect)) {
+            send->request.read_context = context;
+        }
+    }
+    return result;
+}
+
+StepResult Core::cancel_read(const CancelReadIndex& request) {
+    const auto found = pending_read_requests_.find(request.request_id);
+    if (found == pending_read_requests_.end()) {
+        return {};
+    }
+
+    pending_reads_.erase(found->second);
+    pending_read_requests_.erase(found);
+    ++rejected_read_count_;
+    return {
+        .effects = {
+            ReadIndexRejected{
+                request.request_id,
+                ReadIndexFailure::cancelled}}};
+}
+
+StepResult Core::timeout_read(const TimeoutReadIndex& request) {
+    const auto found = pending_read_requests_.find(request.request_id);
+    if (found == pending_read_requests_.end()) {
+        return {};
+    }
+    pending_reads_.erase(found->second);
+    pending_read_requests_.erase(found);
+    ++rejected_read_count_;
+    return {
+        .effects = {
+            ReadIndexRejected{
+                request.request_id,
+                ReadIndexFailure::timed_out}}};
+}
+
+void Core::acknowledge_read(
+    const figure2::ReceiveAppendEntriesResponse& response,
+    StepResult& result) {
+    if (state_.role != RaftRole::leader
+        || response.response.term != state_.persistent.current_term
+        || !response.response.succeeded
+        || !response.response.read_context) {
+        return;
+    }
+    const auto found =
+        pending_reads_.find(*response.response.read_context);
+    if (found == pending_reads_.end()) {
+        return;
+    }
+    found->second.acknowledgements.insert(response.from);
+    const auto majority = (state_.peers.size() + 1) / 2 + 1;
+    if (found->second.acknowledgements.size() >= majority) {
+        found->second.quorum_confirmed = true;
+    }
+    complete_ready_reads(result);
+}
+
+void Core::complete_ready_reads(StepResult& result) {
+    for (auto current = pending_reads_.begin();
+         current != pending_reads_.end();) {
+        auto& pending = current->second;
+        if (!pending.quorum_confirmed
+            || state_.volatile_state.last_applied
+                < pending.read_index) {
+            ++current;
+            continue;
+        }
+        result.effects.emplace_back(ReadIndexResponse{
+            .request_id = pending.request.request_id,
+            .committed_index = pending.read_index});
+        pending_read_requests_.erase(pending.request.request_id);
+        ++completed_read_count_;
+        current = pending_reads_.erase(current);
+    }
+}
+
+void Core::reject_pending_reads(
+    const ReadIndexFailure reason,
+    StepResult& result) {
+    for (const auto& [context, pending] : pending_reads_) {
+        static_cast<void>(context);
+        result.effects.emplace_back(ReadIndexRejected{
+            pending.request.request_id,
+            reason});
+        ++rejected_read_count_;
+    }
+    pending_reads_.clear();
+    pending_read_requests_.clear();
 }
 
 void Core::schedule_application(StepResult& result) {
