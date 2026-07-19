@@ -35,13 +35,15 @@ Implemented now:
   ordered completion-driven state-machine apply
 - Context-correlated ReadIndex with current-term quorum confirmation,
   applied-index gating, explicit uncertainty, and bounded pending reads
+- Canonical applied-state Raft snapshots, publication-gated log compaction,
+  whole-snapshot InstallSnapshot, and lagging-follower suffix resumption
 
 Declared but not implemented:
 
 - Historical MVCC
 - Integration of state-machine commands with the WAL and snapshot body
 - Embedded durable backend
-- Production Raft transport, membership, and snapshots
+- Production Raft transport and membership changes
 - Network server, authentication, and metrics
 - Remote client transport and real leader-failover integration
 

@@ -38,3 +38,9 @@ and voter/learner node IDs must be nonzero and unique across both lists.
 
 Unknown versions, flags, header sizes, impossible lengths, trailing bytes, and
 checksum mismatches are invalid. Readers do not partially restore a snapshot.
+
+The Raft core's `PersistRaftSnapshot` effect maps metadata and state directly
+to this format. `SnapshotStore::publish` completion must precede any
+snapshot-covered WAL truncation. InstallSnapshot is a typed consensus-core
+contract and private simulator encoding, not a new durable or production wire
+format.

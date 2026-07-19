@@ -39,7 +39,7 @@ staleness. The default critical path remains linearizable.
 +---------------------------------------------------+
 | Request validation, auth, quotas, idempotency     |
 +---------------------------------------------------+
-| Raft: elections, replication, commit, ReadIndex   |
+| Raft: election, replication, commit, snapshots    |
 +---------------------------------------------------+
 | Deterministic state-machine apply                 |
 +---------------------------------------------------+

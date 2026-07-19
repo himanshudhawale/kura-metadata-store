@@ -78,6 +78,9 @@ struct LeaderState {
 struct ElectionTimeout {};
 struct HeartbeatTimeout {};
 struct ApplyCommitted {};
+struct ObserveTerm {
+    Term term;
+};
 
 struct ReceiveRequestVote {
     NodeId from;
@@ -107,6 +110,7 @@ using Event = std::variant<
     ElectionTimeout,
     HeartbeatTimeout,
     ApplyCommitted,
+    ObserveTerm,
     ReceiveRequestVote,
     ReceiveRequestVoteResponse,
     ReceiveAppendEntries,

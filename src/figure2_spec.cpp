@@ -120,18 +120,34 @@ const std::vector<RuleDescriptor> rule_catalog{
 
 std::uint64_t last_index(const State& state) {
     return state.persistent.log.empty()
-        ? 0
+        ? (state.persistent.snapshot
+              ? state.persistent.snapshot->last_included_index.value
+              : 0)
         : state.persistent.log.back().index.value;
 }
 
 Term last_term(const State& state) {
     return state.persistent.log.empty()
-        ? Term{}
+        ? (state.persistent.snapshot
+              ? state.persistent.snapshot->last_included_term
+              : Term{})
         : state.persistent.log.back().term;
 }
 
 Term term_at(const State& state, const std::uint64_t index) {
-    return index == 0 ? Term{} : state.persistent.log.at(index - 1).term;
+    if (index == 0) {
+        return {};
+    }
+    const auto base = state.persistent.snapshot
+        ? state.persistent.snapshot->last_included_index.value
+        : 0;
+    if (state.persistent.snapshot && index == base) {
+        return state.persistent.snapshot->last_included_term;
+    }
+    if (index <= base) {
+        throw std::out_of_range("Raft log index was compacted");
+    }
+    return state.persistent.log.at(index - base - 1).term;
 }
 
 std::size_t majority(const State& state) {
@@ -198,12 +214,16 @@ AppendEntriesRequest append_request(
     const NodeId peer,
     const std::optional<ReadIndexContext> read_context = std::nullopt) {
     const auto& progress = state.leader->progress.at(peer);
-    const auto previous = progress.next_index.value - 1;
+    const auto base = state.persistent.snapshot
+        ? state.persistent.snapshot->last_included_index.value
+        : 0;
+    const auto next = std::max(progress.next_index.value, base + 1);
+    const auto previous = next - 1;
     std::vector<LogEntry> entries;
-    if (progress.next_index.value <= last_index(state)) {
+    if (next <= last_index(state)) {
         entries.assign(
             state.persistent.log.begin()
-                + static_cast<std::ptrdiff_t>(progress.next_index.value - 1),
+                + static_cast<std::ptrdiff_t>(next - base - 1),
             state.persistent.log.end());
     }
     return {
@@ -277,7 +297,9 @@ void start_election(StepResult& result) {
 
 template <typename Rpc>
 Term rpc_term(const Rpc& rpc) {
-    if constexpr (
+    if constexpr (std::is_same_v<Rpc, ObserveTerm>) {
+        return rpc.term;
+    } else if constexpr (
         std::is_same_v<Rpc, ReceiveRequestVote>
         || std::is_same_v<Rpc, ReceiveAppendEntries>) {
         return rpc.request.term;
@@ -388,7 +410,11 @@ void handle_append_entries(
     result.effects.push_back(ResetElectionTimer{});
 
     const auto previous = event.request.previous_log_index.value;
-    const bool matches = previous <= last_index(result.state)
+    const auto base = result.state.persistent.snapshot
+        ? result.state.persistent.snapshot->last_included_index.value
+        : 0;
+    const bool matches = previous >= base
+        && previous <= last_index(result.state)
         && term_at(result.state, previous) == event.request.previous_log_term;
     if (!matches) {
         result.rules.push_back(RuleId::append_entries_reject_log_mismatch);
@@ -433,7 +459,7 @@ void handle_append_entries(
             }
             result.state.persistent.log.erase(
                 result.state.persistent.log.begin()
-                    + static_cast<std::ptrdiff_t>(index - 1),
+                    + static_cast<std::ptrdiff_t>(index - base - 1),
                 result.state.persistent.log.end());
             log_changed = true;
             break;
@@ -543,7 +569,14 @@ void handle_apply(StepResult& result) {
     const auto index = result.state.volatile_state.last_applied;
     result.rules.push_back(RuleId::apply_committed);
     result.effects.push_back(ApplyCommand{
-        index, result.state.persistent.log.at(index.value - 1).command});
+        index,
+        result.state.persistent.log.at(
+            index.value
+            - (result.state.persistent.snapshot
+                   ? result.state.persistent.snapshot
+                         ->last_included_index.value
+                   : 0)
+            - 1).command});
     if (result.state.leader
         && result.state.leader->pending_clients.erase(index) != 0) {
         result.effects.push_back(CompleteClientCommand{index});
@@ -615,10 +648,29 @@ std::vector<InvariantViolation> validate(const State& state) {
             violations.push_back({"peer list contains a duplicate"});
         }
     }
-    std::uint64_t expected = 1;
+    const auto base = state.persistent.snapshot
+        ? state.persistent.snapshot->last_included_index.value
+        : 0;
+    std::uint64_t expected = base + 1;
+    if (state.persistent.snapshot
+        && state.persistent.snapshot->last_included_index.value == 0) {
+        violations.push_back({"snapshot index must be nonzero"});
+    }
+    if (state.persistent.snapshot
+        && (state.persistent.snapshot->last_included_term == Term{}
+            || state.persistent.snapshot->last_included_term
+                > state.persistent.current_term)) {
+        violations.push_back(
+            {"snapshot term must be nonzero and not exceed currentTerm"});
+    }
+    if (state.volatile_state.commit_index.value < base
+        || state.volatile_state.last_applied.value < base) {
+        violations.push_back({"commit/apply index precedes the snapshot"});
+    }
     for (const auto& entry : state.persistent.log) {
         if (entry.index.value != expected++) {
-            violations.push_back({"log indexes must be contiguous from one"});
+            violations.push_back(
+                {"log indexes must be contiguous after the snapshot"});
             break;
         }
         if (entry.term > state.persistent.current_term) {
@@ -720,6 +772,8 @@ StepResult step(const State& state, const Event& event) {
                 }
             } else if constexpr (std::is_same_v<Concrete, ApplyCommitted>) {
                 handle_apply(result);
+            } else if constexpr (std::is_same_v<Concrete, ObserveTerm>) {
+                observe_higher_term(result, concrete);
             } else if constexpr (
                 std::is_same_v<Concrete, ReceiveRequestVote>) {
                 handle_request_vote(result, concrete);
