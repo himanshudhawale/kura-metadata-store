@@ -151,8 +151,9 @@ delete would currently find no key.
 Selected operations execute in order. A range sees writes from earlier
 operations in its branch. Results preserve request order and are typed as
 `RangeRead`, `PutResult`, or `DeleteRangeResult`. A zero range limit means
-unlimited. Historical range revisions and nonzero put lease IDs are rejected
-because historical MVCC and leases are not implemented.
+unlimited. Historical range revisions are rejected because historical MVCC is not
+implemented. A put may carry zero for no lease or the ID of an active lease;
+an unknown lease rejects the complete selected branch.
 
 If at least one put or effective delete occurs, the store revision advances
 exactly once and every mutation uses it. Read-only branches and branches whose
@@ -217,21 +218,33 @@ Design rationale and edge cases are documented in
 
 ## 6. Lease
 
-A lease is a replicated TTL record. Keys attached to an expired or revoked
-lease are deleted in one deterministic state-machine operation.
-
-Planned operations:
+A lease is a future replicated TTL record. The current in-memory store
+implements:
 
 ```text
-grantLease(ttl)
-keepAlive(leaseId)
-timeToLive(leaseId)
-revokeLease(leaseId)
+grant_lease(request, now)
+keep_alive(request, now)
+time_to_live(leaseId, now)
+revoke_lease(request)
+expire_leases(now)
 ```
 
+Time is explicit state-machine input; followers must never independently infer
+expiry from their wall clocks. One expiry apply removes every due lease and
+deletes all attached keys in one revision and atomic watch batch. Revoke has
+the same cascade semantics for one lease. Grant and keepalive do not advance
+the key-value revision when no key changes.
+
+Transaction puts attach or reattach keys to active leases. A
+`CompareTarget::lease_id` check can verify that an ownership key still carries
+the expected lease in the same transaction as a protected write.
+
 A client believing it holds a lease is not sufficient for mutual exclusion.
-Protected writes must execute a server-side transaction that verifies the live
-lease or fencing revision.
+Protected writes must execute a server-side transaction that verifies the
+lease attachment and fencing modification revision.
+
+Design rationale and edge cases are documented in
+[Design 0004: Lease lifecycle and fenced ownership](design/0004-lease-lifecycle-and-fenced-ownership.md).
 
 ## 7. Request idempotency
 

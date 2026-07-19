@@ -16,6 +16,7 @@
 #include "kura/metadata/kv/compare.hpp"
 #include "kura/metadata/kv/transaction_request.hpp"
 #include "kura/metadata/kv/transaction_result.hpp"
+#include "kura/metadata/lease/lease_request.hpp"
 #include "kura/metadata/lease/lease_scheduler.hpp"
 #include "kura/metadata/raft/raft_node.hpp"
 #include "kura/metadata/raft/snapshot_metadata.hpp"
@@ -29,6 +30,7 @@
 
 #include <array>
 #include <barrier>
+#include <chrono>
 #include <cstdint>
 #include <exception>
 #include <future>
@@ -51,6 +53,10 @@ using kura::metadata::DeleteRequest;
 using kura::metadata::InMemoryMetadataStore;
 using kura::metadata::KeyRange;
 using kura::metadata::KeyValue;
+using kura::metadata::LeaseGrantRequest;
+using kura::metadata::LeaseId;
+using kura::metadata::LeaseKeepAliveRequest;
+using kura::metadata::LeaseRevokeRequest;
 using kura::metadata::PutRequest;
 using kura::metadata::PutResult;
 using kura::metadata::RangeRead;
@@ -100,10 +106,12 @@ KeyRange key_range(
 PutRequest transaction_put(
     const std::string_view key,
     const std::string_view value,
-    const bool return_previous = false) {
+    const bool return_previous = false,
+    const std::int64_t lease_id = 0) {
     return {
         .key = bytes(key),
         .value = bytes(value),
+        .lease_id = lease_id,
         .return_previous = return_previous};
 }
 
@@ -1005,6 +1013,154 @@ void failed_mutations_emit_no_watch_events() {
         "failed and no-op mutations emit no watch event");
 }
 
+void leases_grant_keep_alive_and_report_ttl() {
+    using namespace std::chrono_literals;
+    InMemoryMetadataStore store;
+    const auto start = kura::metadata::Clock::TimePoint{};
+    const auto granted = store.grant_lease(
+        LeaseGrantRequest{.ttl = 10s},
+        start);
+
+    expect(granted.lease.id.value == 1, "automatic lease IDs start positive");
+    expect(
+        granted.lease.granted_ttl == 10s
+            && granted.lease.remaining_ttl == 10s,
+        "grant reports its full TTL");
+    expect(
+        store.time_to_live(granted.lease.id, start + 3s)
+                .lease.remaining_ttl
+            == 7s,
+        "TTL lookup reports remaining logical time");
+
+    const auto renewed = store.keep_alive(
+        LeaseKeepAliveRequest{.id = granted.lease.id},
+        start + 5s);
+    expect(
+        renewed.lease.remaining_ttl == 10s
+            && store.time_to_live(granted.lease.id, start + 12s)
+                    .lease.remaining_ttl
+                == 3s,
+        "keepalive resets the deadline from its apply time");
+    expect(store.revision() == 0, "lease timing alone does not change KV revision");
+}
+
+void lease_transactions_attach_reattach_and_fence() {
+    using namespace std::chrono_literals;
+    InMemoryMetadataStore store;
+    const auto now = kura::metadata::Clock::TimePoint{};
+    const LeaseId first = store.grant_lease(
+        LeaseGrantRequest{.requested_id = LeaseId{10}, .ttl = 30s},
+        now).lease.id;
+    const LeaseId second = store.grant_lease(
+        LeaseGrantRequest{.requested_id = LeaseId{20}, .ttl = 30s},
+        now).lease.id;
+
+    const auto attached = store.transaction(transaction_request(
+        {},
+        {transaction_put("owner", "writer-a", false, first.value)}));
+    expect(
+        std::get<PutResult>(attached.responses[0]).current.lease_id
+            == first.value,
+        "transaction put attaches a live lease");
+
+    const auto fenced = store.transaction(transaction_request(
+        {Compare{
+            .key = bytes("owner"),
+            .target = CompareTarget::lease_id,
+            .result = CompareResult::equal,
+            .expected = first.value}},
+        {transaction_put("published", "snapshot")}));
+    expect(fenced.succeeded, "lease comparison fences protected writes");
+
+    const auto reattached = store.transaction(transaction_request(
+        {},
+        {transaction_put("owner", "writer-b", false, second.value)}));
+    expect(
+        std::get<PutResult>(reattached.responses[0]).current.lease_id
+            == second.value,
+        "updating a key can move it to another lease");
+    static_cast<void>(store.revoke_lease(
+        LeaseRevokeRequest{.id = first}));
+    expect(
+        store.get(bytes("owner")).value.has_value(),
+        "revoking the old lease does not delete a reattached key");
+}
+
+void lease_revoke_and_expiry_cascade_atomically() {
+    using namespace std::chrono_literals;
+    InMemoryMetadataStore store;
+    const auto now = kura::metadata::Clock::TimePoint{};
+    const LeaseId first = store.grant_lease(
+        LeaseGrantRequest{.ttl = 5s},
+        now).lease.id;
+    const LeaseId second = store.grant_lease(
+        LeaseGrantRequest{.ttl = 5s},
+        now).lease.id;
+    static_cast<void>(store.transaction(transaction_request(
+        {},
+        {
+            transaction_put("a", "1", false, first.value),
+            transaction_put("b", "2", false, first.value),
+            transaction_put("c", "3", false, second.value),
+        })));
+    static_cast<void>(store.create_watch(range_watch(1, "a", "z")));
+
+    const auto revoked = store.revoke_lease(
+        LeaseRevokeRequest{.id = first});
+    expect(
+        revoked.header.revision == 2
+            && !store.get(bytes("a")).value
+            && !store.get(bytes("b")).value
+            && store.get(bytes("c")).value.has_value(),
+        "revoke removes all and only attached keys in one revision");
+    const auto revoke_events = store.poll_watch(WatchId{1});
+    expect(
+        revoke_events && revoke_events->events.size() == 2
+            && revoke_events->events[0].revision.value == 2
+            && revoke_events->events[1].revision.value == 2,
+        "revoke publishes one atomic ordered watch batch");
+
+    expect(store.expire_leases(now + 4s) == 0, "lease is live before deadline");
+    expect(store.expire_leases(now + 5s) == 1, "deadline expires the lease");
+    expect(
+        !store.get(bytes("c")).value && store.revision() == 3,
+        "expiry cascade uses one mutation revision");
+    expect_throws<StoreError>(
+        [&store, second, now] {
+            static_cast<void>(store.keep_alive(
+                LeaseKeepAliveRequest{.id = second},
+                now));
+        },
+        "expired leases cannot be renewed after expiry is applied");
+}
+
+void lease_validation_and_limits_are_explicit() {
+    using namespace std::chrono_literals;
+    StoreLimits limits;
+    limits.max_active_leases = 1;
+    InMemoryMetadataStore store(limits);
+    const auto now = kura::metadata::Clock::TimePoint{};
+    static_cast<void>(store.grant_lease(
+        LeaseGrantRequest{.requested_id = LeaseId{7}, .ttl = 1s},
+        now));
+
+    expect_throws<StoreError>(
+        [&store, now] {
+            static_cast<void>(store.grant_lease(
+                LeaseGrantRequest{.ttl = 1s},
+                now));
+        },
+        "active lease limit must reject grants");
+    expect_throws<StoreError>(
+        [&store] {
+            static_cast<void>(store.transaction(transaction_request(
+                {},
+                {transaction_put("key", "value", false, 99)})));
+        },
+        "transaction cannot attach an unknown lease");
+    expect(!store.get(bytes("key")).value, "failed attachment is atomic");
+}
+
 }  // namespace
 
 int main() {
@@ -1037,7 +1193,11 @@ int main() {
         {"watch revision errors", watches_report_compacted_and_future_revisions},
         {"watch limits", watches_enforce_limits_and_backpressure},
         {"watch concurrent delivery", concurrent_watch_delivery_is_ordered_and_unique},
-        {"watch failed mutations", failed_mutations_emit_no_watch_events}};
+        {"watch failed mutations", failed_mutations_emit_no_watch_events},
+        {"lease TTL lifecycle", leases_grant_keep_alive_and_report_ttl},
+        {"lease transaction fencing", lease_transactions_attach_reattach_and_fence},
+        {"lease cascade deletion", lease_revoke_and_expiry_cascade_atomically},
+        {"lease validation", lease_validation_and_limits_are_explicit}};
 
     int failures = 0;
     for (const auto& [name, test] : tests) {

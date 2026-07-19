@@ -28,7 +28,9 @@ Exit criteria:
 
 **Status:** Started. The current in-memory slice implements general
 If/Then/Else transactions and multi-key single-revision mutations only.
-Historical MVCC, watches, leases, and request deduplication remain unimplemented.
+Historical MVCC and request deduplication remain unimplemented. In-process
+watches and deterministic lease lifecycle behavior are implemented; they are
+not yet persistent or replicated.
 
 Deliver:
 

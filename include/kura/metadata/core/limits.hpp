@@ -11,6 +11,7 @@ struct StoreLimits {
     std::size_t max_watchers{10'000};
     std::size_t max_watch_history_revisions{1'024};
     std::size_t max_watch_pending_responses{128};
+    std::size_t max_active_leases{10'000};
 };
 
 }  // namespace kura::metadata

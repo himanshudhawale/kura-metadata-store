@@ -1,13 +1,17 @@
 #pragma once
 
 #include "kura/metadata/core/limits.hpp"
+#include "kura/metadata/core/clock.hpp"
 #include "kura/metadata/kv/transaction_request.hpp"
 #include "kura/metadata/kv/transaction_result.hpp"
+#include "kura/metadata/lease/lease_request.hpp"
+#include "kura/metadata/lease/lease_response.hpp"
 #include "kura/metadata/metadata_store.hpp"
 #include "kura/metadata/watch/watch_request.hpp"
 #include "kura/metadata/watch/watch_response.hpp"
 
 #include <cstdint>
+#include <chrono>
 #include <deque>
 #include <map>
 #include <shared_mutex>
@@ -48,6 +52,23 @@ public:
     [[nodiscard]] TransactionResult transaction(
         const TransactionRequest& request) override;
 
+    [[nodiscard]] LeaseResponse grant_lease(
+        const LeaseGrantRequest& request,
+        Clock::TimePoint now);
+
+    [[nodiscard]] LeaseResponse keep_alive(
+        const LeaseKeepAliveRequest& request,
+        Clock::TimePoint now);
+
+    [[nodiscard]] LeaseResponse time_to_live(
+        LeaseId id,
+        Clock::TimePoint now) const;
+
+    [[nodiscard]] LeaseResponse revoke_lease(
+        const LeaseRevokeRequest& request);
+
+    [[nodiscard]] std::size_t expire_leases(Clock::TimePoint now);
+
     [[nodiscard]] WatchResponse create_watch(const WatchRequest& request);
 
     [[nodiscard]] std::optional<WatchResponse> poll_watch(WatchId id);
@@ -78,6 +99,12 @@ private:
         std::int64_t compact_revision;
     };
 
+    struct LeaseState {
+        LeaseId id;
+        std::chrono::seconds granted_ttl;
+        Clock::TimePoint deadline;
+    };
+
     [[nodiscard]] PutResult put_locked(
         const ByteSequence& key,
         const ByteSequence& value);
@@ -93,6 +120,17 @@ private:
         const WatchRequest& request,
         const WatchEvent& event);
 
+    [[nodiscard]] LeaseResponse remove_leases_locked(
+        const std::vector<LeaseId>& ids,
+        LeaseId response_id,
+        std::chrono::seconds granted_ttl);
+
+    [[nodiscard]] LeaseId next_lease_id_locked();
+
+    [[nodiscard]] static std::chrono::seconds remaining_ttl(
+        const LeaseState& lease,
+        Clock::TimePoint now);
+
     [[nodiscard]] std::int64_t next_revision_locked() const;
 
     static void validate_key(const ByteSequence& key);
@@ -104,6 +142,8 @@ private:
     std::int64_t compact_revision_;
     std::deque<EventBatch> history_;
     std::map<WatchId, WatchState> watchers_;
+    std::map<LeaseId, LeaseState> leases_;
+    std::int64_t next_lease_id_{1};
 };
 
 }  // namespace kura::metadata
