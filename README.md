@@ -1,4 +1,8 @@
-# Kura Metadata Store
+<p align="center">
+  <img src="assets/kura-metadata-store-icon.svg" width="180" alt="Kura Metadata Store: a K monogram inside a data cube">
+</p>
+
+<h1 align="center">Kura Metadata Store</h1>
 
 Kura Metadata Store is a small, strongly consistent metadata service being
 built from first principles. Its long-term role is to provide reusable
@@ -106,6 +110,7 @@ not read a wall clock, and no background expiry driver is implemented.
 - [ADR-0001: phase claims](docs/decisions/0001-phase-claims.md)
 - [ADR-0002: C++23 implementation](docs/decisions/0002-cpp23-implementation.md)
 - [ADR-0003: internal Raft implementation](docs/decisions/0003-internal-raft.md)
+- [Brand assets and usage](docs/brand.md)
 - [Durable WAL and snapshot design](docs/design/0005-durable-wal-snapshots.md)
 - [WAL format v1](docs/formats/wal-v1.md)
 - [Snapshot format v1](docs/formats/snapshot-v1.md)
