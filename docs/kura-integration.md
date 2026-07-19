@@ -109,7 +109,7 @@ This favors metadata correctness over write availability during partitions.
 
 ## 8. Required helper client
 
-A future Java helper hides unsafe composition:
+A future C++ client library hides unsafe composition:
 
 ```text
 acquireWriter(tableId, ttl) -> WriterGuard
