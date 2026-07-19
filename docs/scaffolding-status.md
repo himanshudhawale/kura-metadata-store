@@ -11,8 +11,10 @@ Implemented now:
 - Put, erase, and modification-revision compare-and-set
 - In-memory If/Then/Else transactions with typed range, put, and delete results
 - Atomic multi-key transaction publication using one revision
+- Resumable in-process watches with bounded history and backpressure
 - Deterministic lease grant, keepalive, TTL, revoke, and expiry
-- Fenced transaction ownership, key attachment, and atomic cascade deletion
+- Fenced transaction ownership, key attachment, and watched atomic cascade
+  deletion
 - Canonical in-memory key/lease snapshot representation
 - Synchronized concurrent access
 - Dependency-free CRC32C, segmented WAL, and atomic snapshot storage boundary
@@ -22,8 +24,8 @@ Implemented now:
 Declared but not implemented:
 
 - Historical MVCC
-- Watches
-- WAL, snapshots, and durable backend
+- Integration of state-machine commands with the WAL and snapshot body
+- Embedded durable backend
 - Raft and membership
 - Network server, authentication, and metrics
 - Remote client and Kura helper

@@ -17,15 +17,17 @@ resume with stale local state. Every protected mutation therefore needs a
 server-side fencing check in the same transaction as the mutation.
 
 This design implements only the single-node, in-memory deterministic state
-machine. It does not provide replication, durable snapshots, cross-node
-linearizability, or an expiry-driving service.
+machine. It does not provide replication, durable snapshot serialization,
+cross-node linearizability, or an expiry-driving service.
 
 ## Chosen design
 
 ### Logical time
 
 The core uses `LeaseTick`, an unsigned 64-bit logical value supplied explicitly
-on every lease command and fenced transaction. It never reads a wall clock.
+on every mutating lease command and fenced transaction. TTL lookup also
+receives an explicit tick but does not advance applied logical time. The core
+never reads a wall clock.
 `LeaseDuration` is a positive number of ticks. A lease granted at tick `t` with
 TTL `d` is live exactly while `now < t + d`; it is expired at the deadline.
 
@@ -81,7 +83,9 @@ durable snapshot implementation.
 Grant and keepalive alter lease state without changing the key revision.
 TTL lookup is read-only. A nonempty revoke or expiry batch advances the revision
 exactly once, including a lease with no attached keys. Every attached-key
-deletion belongs to that one revision. An empty expiry batch and unknown or
+deletion belongs to that one revision and one ordered watch batch. An empty
+event batch is retained when no keys were attached so progress watches can
+observe the lifecycle revision. An empty expiry batch and unknown or
 fencing-mismatched revoke are no-ops.
 
 ### Result and error model
@@ -139,9 +143,10 @@ does delete it.
 
 The expiry set is ordered by lease ID and deleted keys are globally sorted by
 unsigned byte ordering before publication and response construction. Cleanup
-is prepared against private copies and published by map swaps. Either every
-lease and key in the batch disappears at one revision or the old state remains.
-This preserves the transaction implementation's strong exception guarantee.
+and watch publication are prepared against private copies and published by
+swaps. Either every lease, key, and watch batch is published at one revision or
+the old state remains. This preserves the transaction implementation's strong
+exception guarantee.
 
 ## Invariants
 
@@ -227,9 +232,12 @@ accepted only with verified ownership. Existing custom `MetadataStore`
 implementations must implement the additive lifecycle virtual methods.
 
 The older initial-values constructor still accepts only unleased values. Lease
-state restoration uses the validating `InMemoryStoreSnapshot` constructor.
-There is still no historical MVCC, watch dependency, request deduplication,
-network service, durable storage, or Raft behavior.
+state restoration uses the validating `InMemoryStoreSnapshot` constructor and
+enforces the configured active-lease limit. Lease key deletion is published
+through the existing resumable watch subsystem. Watch registrations and event
+history remain process-local and are not part of the logical lease snapshot.
+There is still no historical MVCC, request deduplication, network service,
+durable state-machine serialization, or Raft behavior.
 
 ## Validation and testing
 
@@ -241,9 +249,11 @@ Targeted tests cover:
 - a paused owner fenced after expiry and explicit ID reuse;
 - multiple overdue leases expiring in one sorted batch after a pause;
 - leased-put validation and expired transaction ownership;
-- reattachment followed by old and new lease expiry; and
-- canonical snapshot round-trip with lease and attachment state.
+- reattachment followed by old and new lease expiry;
+- canonical snapshot round-trip with lease and attachment state;
+- snapshot invariant and active-lease-limit validation; and
+- one atomic watch batch for lease cleanup.
 
-The complete existing MSVC Release build and CTest suite also verifies that
+The complete existing MSVC build and CTest suite also verifies that
 point key, revision, version, range, CAS, and If/Then/Else semantics remain
 unchanged.

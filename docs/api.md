@@ -162,7 +162,7 @@ counter overflow fail atomically without changing state.
 
 The exclusive in-memory transaction boundary makes concurrent comparisons,
 branch execution, and publication atomic within one process. It does not claim
-cross-node linearizability, durability, or watch delivery.
+cross-node linearizability or durability.
 
 Design and edge cases are documented in
 [Design 0002: In-memory If/Then/Else Transactions](design/0002-if-then-else-transactions.md).
@@ -240,8 +240,9 @@ Keepalive resets the original TTL only for the current live generation.
 
 `expireLeases` processes every due lease in lease-ID order. Revoke and expiry
 remove all attached keys in unsigned key order and publish one atomic revision
-per nonempty lease batch. Reattaching a key removes it from the old lease before
-adding it to the new lease, so old-lease expiry cannot delete it.
+and watch batch per nonempty lease batch. Reattaching a key removes it from the
+old lease before adding it to the new lease, so old-lease expiry cannot delete
+it.
 
 `TransactionRequest::lease_ownership` contains `(lease ID, fencing token)`
 comparisons evaluated at `lease_tick` with ordinary key comparisons. A stale or
@@ -255,7 +256,10 @@ resources must likewise honor the fencing token.
 
 `InMemoryStoreSnapshot` includes lease records, ordered attachments, logical
 tick, and allocation counters for later serialization and replicated command
-application. It is an in-memory representation, not durable snapshot storage.
+application. Restoration validates allocation counters, lease limits, key
+metadata, duplicates, and both directions of the attachment index. It is an
+in-memory representation suitable for an opaque durable snapshot body, not the
+durable serialization itself.
 
 Full rationale and edge cases are documented in
 [Design 0004: Lease Lifecycle and Fenced Ownership](design/0004-lease-lifecycle-and-fencing.md).

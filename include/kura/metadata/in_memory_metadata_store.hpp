@@ -1,7 +1,7 @@
 #pragma once
 
-#include "kura/metadata/core/limits.hpp"
 #include "kura/metadata/core/clock.hpp"
+#include "kura/metadata/core/limits.hpp"
 #include "kura/metadata/kv/transaction_request.hpp"
 #include "kura/metadata/kv/transaction_result.hpp"
 #include "kura/metadata/lease/lease_snapshot.hpp"
@@ -32,7 +32,9 @@ public:
         std::int64_t initial_revision,
         StoreLimits limits = {});
 
-    explicit InMemoryMetadataStore(InMemoryStoreSnapshot snapshot);
+    explicit InMemoryMetadataStore(
+        InMemoryStoreSnapshot snapshot,
+        StoreLimits limits = {});
 
     [[nodiscard]] StoreRead get(const ByteSequence& key) const override;
 
@@ -71,9 +73,36 @@ public:
 
     [[nodiscard]] InMemoryStoreSnapshot snapshot() const;
 
+    [[nodiscard]] WatchResponse create_watch(const WatchRequest& request);
+
+    [[nodiscard]] std::optional<WatchResponse> poll_watch(WatchId id);
+
+    void request_watch_progress(WatchId id);
+
+    [[nodiscard]] WatchResponse cancel_watch(WatchId id);
+
+    [[nodiscard]] std::int64_t compact_revision() const;
+
     [[nodiscard]] std::int64_t revision() const override;
 
 private:
+    struct EventBatch {
+        std::int64_t revision;
+        std::vector<WatchEvent> events;
+    };
+
+    struct WatchState {
+        WatchRequest request;
+        std::deque<WatchResponse> pending;
+        std::optional<WatchResponse> terminal;
+    };
+
+    struct StagedWatchPublication {
+        std::deque<EventBatch> history;
+        std::map<WatchId, WatchState> watchers;
+        std::int64_t compact_revision;
+    };
+
     struct StoredLease {
         FencingToken fencing_token;
         LeaseDuration granted_ttl;
@@ -84,6 +113,17 @@ private:
     [[nodiscard]] PutResult put_locked(
         const ByteSequence& key,
         const ByteSequence& value);
+
+    [[nodiscard]] StagedWatchPublication stage_watch_publication_locked(
+        const std::vector<WatchEvent>& events,
+        std::int64_t mutation_revision) const;
+
+    void commit_watch_publication_locked(
+        StagedWatchPublication& publication) noexcept;
+
+    static bool watch_matches(
+        const WatchRequest& request,
+        const WatchEvent& event);
 
     [[nodiscard]] LeaseRecord lease_record_locked(
         LeaseId id,
@@ -113,8 +153,12 @@ private:
 
     mutable std::shared_mutex mutex_;
     std::map<ByteSequence, KeyValue> values_;
-    std::map<LeaseId, StoredLease> leases_;
+    StoreLimits limits_;
     std::int64_t revision_;
+    std::int64_t compact_revision_;
+    std::deque<EventBatch> history_;
+    std::map<WatchId, WatchState> watchers_;
+    std::map<LeaseId, StoredLease> leases_;
     LeaseTick logical_tick_;
     std::int64_t next_lease_id_{1};
     FencingToken next_fencing_token_{1};

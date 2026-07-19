@@ -95,14 +95,22 @@ InMemoryMetadataStore::InMemoryMetadataStore(
 }
 
 InMemoryMetadataStore::InMemoryMetadataStore(
-    InMemoryStoreSnapshot snapshot)
-    : revision_(snapshot.revision),
+    InMemoryStoreSnapshot snapshot,
+    StoreLimits limits)
+    : limits_(limits),
+      revision_(snapshot.revision),
+      compact_revision_(snapshot.revision),
       logical_tick_(snapshot.logical_tick),
       next_lease_id_(snapshot.next_lease_id),
       next_fencing_token_(snapshot.next_fencing_token) {
     if (revision_ < 0 || next_lease_id_ <= 0
         || next_fencing_token_.value == 0) {
         throw std::invalid_argument("invalid snapshot counters");
+    }
+    if (snapshot.leases.size() > limits_.max_active_leases) {
+        throw StoreError(
+            StatusCode::quota_exceeded,
+            "lease snapshot exceeds active lease limit");
     }
 
     for (const LeaseRecord& lease : snapshot.leases) {
@@ -215,8 +223,20 @@ DeleteResult InMemoryMetadataStore::erase(const ByteSequence& key) {
 
     const std::int64_t mutation_revision = next_revision_locked();
     KeyValue previous = iterator->second;
-    detach_key_locked(previous);
-    values_.erase(iterator);
+    std::map<ByteSequence, KeyValue> working_values = values_;
+    std::map<LeaseId, StoredLease> working_leases = leases_;
+    detach_key(working_leases, previous);
+    working_values.erase(key);
+    const std::vector<WatchEvent> events{WatchEvent{
+        .revision = Revision{mutation_revision},
+        .mutation = MutationEvent{
+            .type = MutationEventType::erase,
+            .current = std::nullopt,
+            .previous = previous}}};
+    StagedWatchPublication publication =
+        stage_watch_publication_locked(events, mutation_revision);
+    values_.swap(working_values);
+    leases_.swap(working_leases);
     revision_ = mutation_revision;
     commit_watch_publication_locked(publication);
     return {
@@ -439,6 +459,7 @@ TransactionResult InMemoryMetadataStore::transaction(
             [&working,
              &working_leases,
              &responses,
+             &events,
              transaction_revision](
                 const auto& typed_operation) {
                 using Operation = std::decay_t<decltype(typed_operation)>;
@@ -506,6 +527,7 @@ TransactionResult InMemoryMetadataStore::transaction(
                         working.lower_bound(typed_operation.range.start);
                     while (iterator != working.end()
                            && iterator->first < typed_operation.range.end) {
+                        const KeyValue erased = iterator->second;
                         detach_key(working_leases, iterator->second);
                         if (typed_operation.return_previous) {
                             previous.push_back(erased);
@@ -539,6 +561,9 @@ TransactionResult InMemoryMetadataStore::transaction(
     if (!request.lease_ownership.empty()) {
         logical_tick_ = request.lease_tick;
     }
+    if (publication.has_value()) {
+        commit_watch_publication_locked(*publication);
+    }
     return {
         .header = ResponseHeader{.revision = transaction_revision},
         .succeeded = comparisons_succeeded,
@@ -559,6 +584,11 @@ LeaseGrantResult InMemoryMetadataStore::grant_lease(
     if (next_fencing_token_.value
         == std::numeric_limits<std::uint64_t>::max()) {
         throw std::overflow_error("fencing token exhausted");
+    }
+    if (leases_.size() >= limits_.max_active_leases) {
+        throw StoreError(
+            StatusCode::quota_exceeded,
+            "active lease limit reached");
     }
 
     LeaseId id = request.requested_id;
@@ -694,52 +724,161 @@ InMemoryStoreSnapshot InMemoryMetadataStore::snapshot() const {
 
 std::int64_t InMemoryMetadataStore::revision() const {
     const std::shared_lock lock(mutex_);
-    const auto iterator = leases_.find(id);
-    if (iterator == leases_.end()) {
+    return revision_;
+}
+
+WatchResponse InMemoryMetadataStore::create_watch(
+    const WatchRequest& request) {
+    const std::unique_lock lock(mutex_);
+    if (request.id.value <= 0) {
         throw StoreError(
-            StatusCode::lease_not_found,
-            "unknown lease");
+            StatusCode::invalid_argument,
+            "watch ID must be positive");
     }
+    if (request.range.start.empty()) {
+        throw StoreError(
+            StatusCode::invalid_argument,
+            "watch key must not be empty");
+    }
+    if (!request.range.end.empty()
+        && request.range.start >= request.range.end) {
+        throw StoreError(
+            StatusCode::invalid_argument,
+            "watch range start must be less than range end");
+    }
+    if (request.start_revision.value < 0) {
+        throw StoreError(
+            StatusCode::invalid_argument,
+            "watch start revision must not be negative");
+    }
+    if (watchers_.contains(request.id)) {
+        throw StoreError(
+            StatusCode::invalid_argument,
+            "watch ID is already active");
+    }
+    if (watchers_.size() >= limits_.max_watchers) {
+        throw StoreError(
+            StatusCode::quota_exceeded,
+            "active watcher limit reached");
+    }
+
+    std::int64_t start_revision = request.start_revision.value;
+    if (start_revision == 0) {
+        if (revision_ == std::numeric_limits<std::int64_t>::max()) {
+            throw StoreError(
+                StatusCode::future_revision,
+                "no revision exists after the current revision");
+        }
+        start_revision = revision_ + 1;
+    }
+    if (start_revision <= compact_revision_) {
+        throw StoreError(
+            StatusCode::compacted,
+            "watch start revision has been compacted",
+            compact_revision_);
+    }
+    if (start_revision > revision_
+        && (revision_ == std::numeric_limits<std::int64_t>::max()
+            || start_revision != revision_ + 1)) {
+        throw StoreError(
+            StatusCode::future_revision,
+            "watch start revision is in the future");
+    }
+
+    WatchState state{.request = request};
+    state.request.start_revision = Revision{start_revision};
+    for (const EventBatch& batch : history_) {
+        if (batch.revision < start_revision) {
+            continue;
+        }
+        std::vector<WatchEvent> matching;
+        for (const WatchEvent& event : batch.events) {
+            if (watch_matches(state.request, event)) {
+                matching.push_back(event);
+            }
+        }
+        if (matching.empty() && !state.request.progress_notifications) {
+            continue;
+        }
+        if (state.pending.size()
+            >= limits_.max_watch_pending_responses) {
+            throw StoreError(
+                StatusCode::quota_exceeded,
+                "watch replay exceeds pending response limit");
+        }
+        state.pending.push_back(WatchResponse{
+            .header = ResponseHeader{.revision = batch.revision},
+            .id = request.id,
+            .events = std::move(matching)});
+    }
+
+    watchers_.emplace(request.id, std::move(state));
     return {
         .header = ResponseHeader{.revision = revision_},
-        .lease = LeaseRecord{
+        .id = request.id};
+}
+
+std::optional<WatchResponse> InMemoryMetadataStore::poll_watch(
+    const WatchId id) {
+    const std::unique_lock lock(mutex_);
+    const auto iterator = watchers_.find(id);
+    if (iterator == watchers_.end()) {
+        throw StoreError(StatusCode::invalid_argument, "unknown watch ID");
+    }
+    WatchState& state = iterator->second;
+    if (state.terminal.has_value()) {
+        WatchResponse response = std::move(*state.terminal);
+        watchers_.erase(iterator);
+        return response;
+    }
+    if (state.pending.empty()) {
+        return std::nullopt;
+    }
+    WatchResponse response = std::move(state.pending.front());
+    state.pending.pop_front();
+    return response;
+}
+
+void InMemoryMetadataStore::request_watch_progress(const WatchId id) {
+    const std::unique_lock lock(mutex_);
+    const auto iterator = watchers_.find(id);
+    if (iterator == watchers_.end()) {
+        throw StoreError(StatusCode::invalid_argument, "unknown watch ID");
+    }
+    WatchState& state = iterator->second;
+    if (state.terminal.has_value()) {
+        return;
+    }
+    if (state.pending.size() >= limits_.max_watch_pending_responses) {
+        state.pending.clear();
+        state.terminal = WatchResponse{
+            .header = ResponseHeader{.revision = revision_},
             .id = id,
-            .granted_ttl = iterator->second.granted_ttl,
-            .remaining_ttl = remaining_ttl(iterator->second, now)}};
+            .status = StatusCode::quota_exceeded,
+            .cancelled = true};
+        return;
+    }
+    state.pending.push_back(WatchResponse{
+        .header = ResponseHeader{.revision = revision_},
+        .id = id});
 }
 
-LeaseResponse InMemoryMetadataStore::revoke_lease(
-    const LeaseRevokeRequest& request) {
+WatchResponse InMemoryMetadataStore::cancel_watch(const WatchId id) {
     const std::unique_lock lock(mutex_);
-    const auto iterator = leases_.find(request.id);
-    if (iterator == leases_.end()) {
-        throw StoreError(
-            StatusCode::lease_not_found,
-            "cannot revoke an unknown lease");
+    const auto iterator = watchers_.find(id);
+    if (iterator == watchers_.end()) {
+        throw StoreError(StatusCode::invalid_argument, "unknown watch ID");
     }
-    return remove_leases_locked(
-        {request.id},
-        request.id,
-        iterator->second.granted_ttl);
+    watchers_.erase(iterator);
+    return {
+        .header = ResponseHeader{.revision = revision_},
+        .id = id,
+        .cancelled = true};
 }
 
-std::size_t InMemoryMetadataStore::expire_leases(
-    const Clock::TimePoint now) {
-    const std::unique_lock lock(mutex_);
-    std::vector<LeaseId> expired;
-    for (const auto& [id, lease] : leases_) {
-        if (lease.deadline <= now) {
-            expired.push_back(id);
-        }
-    }
-    if (expired.empty()) {
-        return 0;
-    }
-    static_cast<void>(remove_leases_locked(
-        expired,
-        expired.front(),
-        leases_.at(expired.front()).granted_ttl));
-    return expired.size();
+std::int64_t InMemoryMetadataStore::compact_revision() const {
+    const std::shared_lock lock(mutex_);
+    return compact_revision_;
 }
 
 PutResult InMemoryMetadataStore::put_locked(
@@ -770,18 +909,108 @@ PutResult InMemoryMetadataStore::put_locked(
         .mod_revision = mutation_revision,
         .lease_id = 0};
 
-    std::map<ByteSequence, KeyValue> working = values_;
-    const auto [stored, inserted] = working.insert_or_assign(key, current);
+    std::map<ByteSequence, KeyValue> working_values = values_;
+    std::map<LeaseId, StoredLease> working_leases = leases_;
+    const auto [stored, inserted] =
+        working_values.insert_or_assign(key, current);
     static_cast<void>(inserted);
     if (previous.has_value()) {
-        detach_key_locked(*previous);
+        detach_key(working_leases, *previous);
     }
+    const std::vector<WatchEvent> events{WatchEvent{
+        .revision = Revision{mutation_revision},
+        .mutation = MutationEvent{
+            .type = MutationEventType::put,
+            .current = stored->second,
+            .previous = previous}}};
+    StagedWatchPublication publication =
+        stage_watch_publication_locked(events, mutation_revision);
+    values_.swap(working_values);
+    leases_.swap(working_leases);
     revision_ = mutation_revision;
     commit_watch_publication_locked(publication);
     return {
         .current = std::move(current),
         .previous = std::move(previous),
         .revision = mutation_revision};
+}
+
+InMemoryMetadataStore::StagedWatchPublication
+InMemoryMetadataStore::stage_watch_publication_locked(
+    const std::vector<WatchEvent>& events,
+    const std::int64_t mutation_revision) const {
+    StagedWatchPublication publication{
+        .history = history_,
+        .watchers = watchers_,
+        .compact_revision = compact_revision_};
+    publication.history.push_back(EventBatch{
+        .revision = mutation_revision,
+        .events = events});
+
+    for (auto& [id, state] : publication.watchers) {
+        if (state.terminal.has_value()) {
+            continue;
+        }
+        std::vector<WatchEvent> matching;
+        for (const WatchEvent& event : events) {
+            if (watch_matches(state.request, event)) {
+                matching.push_back(event);
+            }
+        }
+        if (matching.empty() && !state.request.progress_notifications) {
+            continue;
+        }
+        if (state.pending.size()
+            >= limits_.max_watch_pending_responses) {
+            state.pending.clear();
+            state.terminal = WatchResponse{
+                .header = ResponseHeader{.revision = mutation_revision},
+                .id = id,
+                .status = StatusCode::quota_exceeded,
+                .cancelled = true};
+            continue;
+        }
+        state.pending.push_back(WatchResponse{
+            .header = ResponseHeader{.revision = mutation_revision},
+            .id = id,
+            .events = std::move(matching)});
+    }
+
+    while (publication.history.size()
+           > limits_.max_watch_history_revisions) {
+        publication.compact_revision =
+            publication.history.front().revision;
+        publication.history.pop_front();
+    }
+    return publication;
+}
+
+void InMemoryMetadataStore::commit_watch_publication_locked(
+    StagedWatchPublication& publication) noexcept {
+    history_.swap(publication.history);
+    watchers_.swap(publication.watchers);
+    compact_revision_ = publication.compact_revision;
+}
+
+bool InMemoryMetadataStore::watch_matches(
+    const WatchRequest& request,
+    const WatchEvent& event) {
+    if (request.filter == WatchFilter::exclude_put
+        && event.mutation.type == MutationEventType::put) {
+        return false;
+    }
+    if (request.filter == WatchFilter::exclude_erase
+        && event.mutation.type == MutationEventType::erase) {
+        return false;
+    }
+    const KeyValue& value = event.mutation.current.has_value()
+        ? *event.mutation.current
+        : *event.mutation.previous;
+    if (request.range.end.empty()) {
+        return value.key == request.range.start;
+    }
+    return request.range.start <= value.key
+        && value.key < request.range.end;
 }
 
 LeaseRecord InMemoryMetadataStore::lease_record_locked(
@@ -860,9 +1089,27 @@ LeaseCleanupResult InMemoryMetadataStore::remove_leases_locked(
     for (const LeaseId id : ids) {
         working_leases.erase(id);
     }
+    std::optional<StagedWatchPublication> publication;
+    if (!ids.empty()) {
+        std::vector<WatchEvent> events;
+        events.reserve(result.deleted_keys.size());
+        for (const KeyValue& value : result.deleted_keys) {
+            events.push_back(WatchEvent{
+                .revision = Revision{cleanup_revision},
+                .mutation = MutationEvent{
+                    .type = MutationEventType::erase,
+                    .current = std::nullopt,
+                    .previous = value}});
+        }
+        publication =
+            stage_watch_publication_locked(events, cleanup_revision);
+    }
     values_.swap(working_values);
     leases_.swap(working_leases);
     revision_ = cleanup_revision;
+    if (publication.has_value()) {
+        commit_watch_publication_locked(*publication);
+    }
     return result;
 }
 

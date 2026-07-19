@@ -28,7 +28,8 @@ Exit criteria:
 
 **Status:** Started. The current in-memory slice implements general
 If/Then/Else transactions, multi-key single-revision mutations, and deterministic
-lease lifecycle with fenced ownership. Historical MVCC, watches, and request
+lease lifecycle with fenced ownership. Resumable in-process watches and their
+bounded event history are implemented. Historical MVCC and request
 deduplication remain unimplemented.
 
 Deliver:
