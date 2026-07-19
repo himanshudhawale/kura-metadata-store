@@ -12,7 +12,30 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler:
+          - g++
+          - clang++
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=${{ matrix.compiler }} -DKURA_ENABLE_SANITIZERS=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  thread-sanitizer:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -20,12 +43,28 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Set up Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "21"
-          cache: maven
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=g++ -DKURA_ENABLE_THREAD_SANITIZER=ON
 
-      - name: Build and test
-        run: ./mvnw --batch-mode --no-transfer-progress verify
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build
+
+      - name: Build
+        run: cmake --build build --config Debug --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C Debug --output-on-failure
