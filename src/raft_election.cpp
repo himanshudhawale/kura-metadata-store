@@ -16,6 +16,7 @@ constexpr std::uint8_t hard_state_tag = 3;
 constexpr std::uint8_t append_entries_tag = 4;
 constexpr std::uint8_t append_entries_response_tag = 5;
 constexpr std::uint8_t log_state_tag = 6;
+constexpr std::uint8_t applied_state_tag = 7;
 
 void append_u32(simulation::Bytes& bytes, const std::uint32_t value) {
     for (unsigned shift = 0; shift < 32; shift += 8) {
@@ -195,6 +196,27 @@ std::vector<LogEntry> decode_log(const simulation::Bytes& bytes) {
     return log;
 }
 
+simulation::Bytes encode_applied(const LogIndex index) {
+    simulation::Bytes bytes;
+    bytes.reserve(9);
+    bytes.push_back(applied_state_tag);
+    append_u64(bytes, index.value);
+    return bytes;
+}
+
+LogIndex decode_applied(const simulation::Bytes& bytes) {
+    if (bytes.size() != 9 || bytes.front() != applied_state_tag) {
+        throw std::invalid_argument("invalid simulated applied state");
+    }
+    std::size_t offset = 1;
+    const LogIndex index{read_u64(bytes, offset)};
+    if (index == LogIndex{}) {
+        throw std::invalid_argument(
+            "simulated applied index must be nonzero");
+    }
+    return index;
+}
+
 void validate_recovered_transition(
     const RaftHardState& previous,
     const RaftHardState& next) {
@@ -357,6 +379,7 @@ private:
         }
         RaftHardState recovered;
         std::vector<LogEntry> recovered_log;
+        LogIndex recovered_applied;
         for (const auto& record : event.durable_records) {
             if (record.bytes.empty()) {
                 throw std::invalid_argument("empty simulated Raft record");
@@ -367,6 +390,13 @@ private:
                 recovered = decoded;
             } else if (record.bytes.front() == log_state_tag) {
                 recovered_log = decode_log(record.bytes);
+            } else if (record.bytes.front() == applied_state_tag) {
+                const auto applied = decode_applied(record.bytes);
+                if (applied < recovered_applied) {
+                    throw std::invalid_argument(
+                        "simulated applied index regressed");
+                }
+                recovered_applied = applied;
             } else {
                 throw std::invalid_argument("unknown simulated Raft record");
             }
@@ -382,7 +412,8 @@ private:
             seed,
             config_.timeouts,
             std::move(recovered_log),
-            config_.heartbeat_interval);
+            config_.heartbeat_interval,
+            recovered_applied);
         auto actions = translate(core_->start());
         observe();
         return actions;
@@ -424,19 +455,29 @@ private:
         }
         if (const auto* persisted =
                 std::get_if<simulation::PersistedEvent>(&event)) {
-            if (const auto* pending = core_->pending_log_persistence()) {
+            if (const auto* pending = core_->pending_log_persistence();
+                pending && pending->request_id == persisted->request_id) {
                 return translate(core_->step(RaftLogPersisted{
                     .request_id = persisted->request_id,
                     .log = pending->log}));
             }
             const auto& specification = core_->specification_state();
-            if (!specification.pending_hard_state) {
-                throw std::invalid_argument(
-                    "unexpected simulated persistence completion");
+            if (specification.pending_hard_state
+                && specification.pending_hard_state->request.request_id
+                    == persisted->request_id) {
+                return translate(core_->step(RaftHardStatePersisted{
+                    .request_id = persisted->request_id,
+                    .state =
+                        specification.pending_hard_state->request.state}));
             }
-            return translate(core_->step(RaftHardStatePersisted{
-                .request_id = persisted->request_id,
-                .state = specification.pending_hard_state->request.state}));
+            if (const auto* pending = core_->pending_application();
+                pending && pending->request_id == persisted->request_id) {
+                return translate(core_->step(LogEntryApplied{
+                    .request_id = persisted->request_id,
+                    .index = pending->entry.index}));
+            }
+            throw std::invalid_argument(
+                "unexpected simulated persistence completion");
         }
         throw std::invalid_argument("duplicate Raft election start event");
     }
@@ -457,6 +498,11 @@ private:
                         actions.emplace_back(simulation::PersistAction{
                             .request_id = typed.request_id,
                             .bytes = encode_log(typed.log)});
+                    } else if constexpr (
+                        std::is_same_v<Typed, ApplyLogEntry>) {
+                        actions.emplace_back(simulation::PersistAction{
+                            .request_id = typed.request_id,
+                            .bytes = encode_applied(typed.entry.index)});
                     } else if constexpr (
                         std::is_same_v<Typed, figure2::SendRequestVote>) {
                         actions.emplace_back(simulation::SendAction{
@@ -528,14 +574,18 @@ Core::Core(
     const std::uint64_t seed,
     const TimeoutRange timeouts,
     std::vector<LogEntry> recovered_log,
-    const simulation::LogicalTime heartbeat_interval)
+    const simulation::LogicalTime heartbeat_interval,
+    const LogIndex recovered_applied)
     : state_{
           .node = self,
           .peers = std::move(peers),
           .persistent = {
               .current_term = recovered.current_term,
               .voted_for = recovered.voted_for,
-              .log = std::move(recovered_log)}},
+              .log = std::move(recovered_log)},
+          .volatile_state = {
+              .commit_index = recovered_applied,
+              .last_applied = recovered_applied}},
       timeouts_(timeouts),
       heartbeat_interval_(heartbeat_interval),
       random_state_(seed) {
@@ -577,6 +627,10 @@ Core::Core(
         throw std::invalid_argument(
             "recovered Raft log entries must have nonzero terms");
     }
+    if (recovered_applied.value > state_.persistent.log.size()) {
+        throw std::invalid_argument(
+            "recovered applied index exceeds the Raft log");
+    }
     const auto violations = figure2::validate(state_);
     if (!violations.empty()) {
         throw std::invalid_argument(violations.front().message);
@@ -596,6 +650,56 @@ StepResult Core::step(const Input& input) {
     if (!started_) {
         throw std::logic_error("Raft election core has not started");
     }
+    if (const auto* applied = std::get_if<LogEntryApplied>(&input)) {
+        if (!pending_application_
+            || pending_application_->blocked
+            || applied->request_id
+                != pending_application_->request.request_id
+            || applied->index
+                != pending_application_->request.entry.index) {
+            throw std::invalid_argument(
+                "application completion does not match pending entry");
+        }
+        state_.volatile_state.last_applied = applied->index;
+        pending_application_.reset();
+        StepResult completed;
+        if (state_.leader
+            && state_.leader->pending_clients.erase(applied->index) != 0) {
+            completed.effects.emplace_back(
+                figure2::CompleteClientCommand{applied->index});
+        }
+        schedule_application(completed);
+        return completed;
+    }
+    if (const auto* failed = std::get_if<LogEntryApplyFailed>(&input)) {
+        if (!pending_application_
+            || pending_application_->blocked
+            || failed->request_id
+                != pending_application_->request.request_id
+            || failed->index
+                != pending_application_->request.entry.index) {
+            throw std::invalid_argument(
+                "application failure does not match pending entry");
+        }
+        pending_application_->blocked = true;
+        return {
+            .effects = {
+                ApplicationBackpressured{.index = failed->index}}};
+    }
+    if (std::holds_alternative<RetryApplication>(input)) {
+        if (!pending_application_ || !pending_application_->blocked) {
+            throw std::logic_error(
+                "application retry requires a blocked entry");
+        }
+        if (next_application_request_id_ >= (1ULL << 63)) {
+            throw std::overflow_error(
+                "Raft application request ID exhausted");
+        }
+        pending_application_->request.request_id =
+            next_application_request_id_++;
+        pending_application_->blocked = false;
+        return {.effects = {pending_application_->request}};
+    }
     if (const auto* persisted = std::get_if<RaftLogPersisted>(&input)) {
         if (!pending_log_) {
             throw std::invalid_argument(
@@ -609,6 +713,7 @@ StepResult Core::step(const Input& input) {
         StepResult completed{
             .effects = std::move(pending_log_->deferred_effects)};
         pending_log_.reset();
+        schedule_application(completed);
         return completed;
     }
     if (pending_log_) {
@@ -626,11 +731,9 @@ StepResult Core::step(const Input& input) {
         election_timer_.reset();
         election_timeout_.reset();
         const auto previous = state_.role;
-        const auto previous_commit = state_.volatile_state.commit_index;
         return translate(
             figure2::step(state_, figure2::ElectionTimeout{}),
-            previous,
-            previous_commit);
+            previous);
     }
     if (const auto* heartbeat = std::get_if<HeartbeatDeadline>(&input)) {
         if (!heartbeat_timer_ || heartbeat->timer_id != *heartbeat_timer_
@@ -638,29 +741,28 @@ StepResult Core::step(const Input& input) {
             return {};
         }
         heartbeat_timer_.reset();
-        const auto previous_commit = state_.volatile_state.commit_index;
         auto result = translate(
             figure2::step(state_, figure2::HeartbeatTimeout{}),
-            state_.role,
-            previous_commit);
+            state_.role);
         result.effects.emplace_back(next_heartbeat());
         return result;
     }
     const auto previous = state_.role;
-    const auto previous_commit = state_.volatile_state.commit_index;
     return std::visit(
-        [this, previous, previous_commit](const auto& typed) -> StepResult {
+        [this, previous](const auto& typed) -> StepResult {
             using Typed = std::decay_t<decltype(typed)>;
             if constexpr (
                 std::is_same_v<Typed, ElectionDeadline>
                 || std::is_same_v<Typed, HeartbeatDeadline>
-                || std::is_same_v<Typed, RaftLogPersisted>) {
+                || std::is_same_v<Typed, RaftLogPersisted>
+                || std::is_same_v<Typed, LogEntryApplied>
+                || std::is_same_v<Typed, LogEntryApplyFailed>
+                || std::is_same_v<Typed, RetryApplication>) {
                 return {};
             } else {
                 return translate(
                     figure2::step(state_, typed),
-                    previous,
-                    previous_commit);
+                    previous);
             }
         },
         input);
@@ -684,6 +786,11 @@ Snapshot Core::snapshot() const {
         .heartbeat_timer = heartbeat_timer_,
         .log = state_.persistent.log,
         .peer_progress = std::move(progress),
+        .commit_index = state_.volatile_state.commit_index,
+        .last_applied = state_.volatile_state.last_applied,
+        .application_pending = pending_application_.has_value(),
+        .application_blocked =
+            pending_application_ && pending_application_->blocked,
         .waiting_for_persistence =
             state_.pending_hard_state.has_value() || pending_log_.has_value()};
 }
@@ -696,13 +803,13 @@ const PersistRaftLog* Core::pending_log_persistence() const noexcept {
     return pending_log_ ? &pending_log_->request : nullptr;
 }
 
+const ApplyLogEntry* Core::pending_application() const noexcept {
+    return pending_application_ ? &pending_application_->request : nullptr;
+}
+
 StepResult Core::translate(
     figure2::StepResult result,
-    const RaftRole previous_role,
-    const LogIndex previous_commit) {
-    result.state.volatile_state.commit_index = previous_commit;
-    std::erase(result.rules, figure2::RuleId::append_entries_advance_commit);
-    std::erase(result.rules, figure2::RuleId::leader_advance_commit);
+    const RaftRole previous_role) {
     const bool resets_election = std::ranges::any_of(
         result.effects,
         [](const figure2::Effect& effect) {
@@ -769,7 +876,28 @@ StepResult Core::translate(
             std::move(effect));
     }
     gate_log_persistence(translated);
+    if (!state_.pending_hard_state && !pending_log_) {
+        schedule_application(translated);
+    }
     return translated;
+}
+
+void Core::schedule_application(StepResult& result) {
+    if (pending_application_
+        || state_.volatile_state.last_applied
+            >= state_.volatile_state.commit_index) {
+        return;
+    }
+    if (next_application_request_id_ >= (1ULL << 63)) {
+        throw std::overflow_error("Raft application request ID exhausted");
+    }
+    const LogIndex index{
+        state_.volatile_state.last_applied.value + 1};
+    ApplyLogEntry request{
+        .request_id = next_application_request_id_++,
+        .entry = state_.persistent.log.at(index.value - 1)};
+    pending_application_ = PendingApplication{.request = request};
+    result.effects.emplace_back(std::move(request));
 }
 
 void Core::gate_log_persistence(StepResult& result) {

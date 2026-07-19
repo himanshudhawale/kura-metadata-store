@@ -317,14 +317,15 @@ Public errors will distinguish:
 
 Errors must never turn an uncertain write into a success-shaped response.
 
-## 10. Internal Raft election and replication boundary
+## 10. Internal Raft consensus-core boundary
 
 The internal Raft core is event driven:
 
 ```text
-Core(self, peers, recoveredHardState, seed, timeoutRange, localLog)
-start()                 -> ordered election effects
-step(typed input)       -> ordered election effects
+Core(self, peers, recoveredHardState, seed, timeoutRange,
+     localLog, heartbeatInterval, recoveredApplied)
+start()                 -> ordered effects
+step(typed input)       -> ordered effects
 snapshot()              -> immutable diagnostic state
 ```
 
@@ -339,6 +340,13 @@ Timeout selection is deterministic from an explicit seed and inclusive
 logical-tick range; the core never reads a clock. Followers match the previous
 term/index, strictly replace only conflicting suffixes, and withhold success
 until changed logs are durable. Leaders initialize and update
-`nextIndex`/`matchIndex` and retry by backtracking. This boundary does not
-advance commit or apply commands. Details are in [Design 0009](design/0009-raft-election-core.md)
-and [Design 0011](design/0011-raft-append-entries.md).
+`nextIndex`/`matchIndex` and retry by backtracking. Slice 3 advances leader
+commit only for current-term entries replicated on a majority, propagates a
+bounded follower commit, and emits one ordered `ApplyLogEntry` at a time.
+Matching success/failure inputs drive `lastApplied`, backpressure, retry, and
+leader-owned client completion. Recovered applied state prevents replay of an
+already represented prefix.
+
+Details are in [Design 0009](design/0009-raft-election-core.md),
+[Design 0011](design/0011-raft-append-entries.md), and
+[Design 0012](design/0012-raft-commit-apply.md).
