@@ -23,6 +23,7 @@ find_package(Threads REQUIRED)
 add_library(
     kura_metadata
     src/byte_sequence.cpp
+    src/key_range.cpp
     src/in_memory_metadata_store.cpp)
 
 target_include_directories(

@@ -11,8 +11,28 @@ Ranges are half-open:
 [start, end)
 ```
 
-Prefix helpers calculate the smallest key strictly greater than all values with
-the requested prefix.
+`prefix_range_end(prefix)` returns the smallest key strictly greater than every
+key with the requested prefix, using unsigned lexicographic byte ordering. The
+caller can use the prefix and returned value as `[prefix, end)`.
+
+The helper copies before incrementing and never modifies the supplied
+`ByteSequence`. Carry propagates across trailing `0xff` bytes, which are then
+removed:
+
+```text
+prefix                      end
+"foo"                       "fop"
+[0x01, 0x80]                [0x01, 0x81]
+[0x12, 0xfe, 0xff, 0xff]    [0x12, 0xff]
+```
+
+The return type is `std::optional<ByteSequence>`. An empty prefix or a prefix
+made entirely of `0xff` bytes has no finite upper bound, so the helper returns
+`std::nullopt`; callers must handle that case explicitly rather than passing a
+sentinel as a range end.
+
+Design rationale and rejected alternatives are documented in
+[Design 0001: Binary prefix range](design/0001-binary-prefix-range.md).
 
 ## 2. Key-value metadata
 

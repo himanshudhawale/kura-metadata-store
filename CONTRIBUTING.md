@@ -26,8 +26,10 @@ Before implementation, an issue must describe:
 6. Test strategy
 7. Alternatives and tradeoffs
 
-Small corrections and tests do not require a separate design document. Durable
-formats, protocols, consistency guarantees, and public APIs do.
+Every implementation issue must include or update a document under
+`docs/design/`. The document explains the problem, why it matters, chosen
+design, invariants, alternatives, edge cases, compatibility, and test strategy.
+Small documentation-only corrections may update the affected document directly.
 
 ## Development
 
@@ -48,6 +50,7 @@ Pull requests should:
 
 - Address one coherent change.
 - Link the corresponding issue.
+- Link the corresponding design document.
 - Include tests for changed behavior.
 - Update documentation with public behavior.
 - Avoid unrelated formatting or refactoring.

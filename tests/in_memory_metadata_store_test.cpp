@@ -41,6 +41,7 @@ namespace {
 using kura::metadata::ByteSequence;
 using kura::metadata::CompareAndSetResult;
 using kura::metadata::InMemoryMetadataStore;
+using kura::metadata::prefix_range_end;
 
 class TestFailure final : public std::runtime_error {
 public:
@@ -77,6 +78,51 @@ void byte_sequences_copy_input_and_compare_unsigned() {
         ByteSequence::copy_from(std::array<std::uint8_t, 1>{0xff})
             > ByteSequence::copy_from(std::array<std::uint8_t, 1>{0x01}),
         "ByteSequence ordering must be unsigned");
+}
+
+void prefix_range_end_handles_binary_prefixes() {
+    expect(
+        prefix_range_end(bytes("foo")) == bytes("fop"),
+        "ASCII prefix end must increment the final byte");
+    expect(
+        prefix_range_end(ByteSequence::copy_from(
+            std::array<std::uint8_t, 2>{0x01, 0x80}))
+            == ByteSequence::copy_from(
+                std::array<std::uint8_t, 2>{0x01, 0x81}),
+        "multi-byte prefix end must use unsigned byte ordering");
+    expect(
+        prefix_range_end(ByteSequence::copy_from(
+            std::array<std::uint8_t, 4>{0x12, 0xfe, 0xff, 0xff}))
+            == ByteSequence::copy_from(
+                std::array<std::uint8_t, 2>{0x12, 0xff}),
+        "prefix end must carry across trailing 0xff bytes");
+}
+
+void prefix_range_end_reports_unbounded_prefixes() {
+    expect(
+        !prefix_range_end(ByteSequence{}).has_value(),
+        "empty prefix must have no finite upper bound");
+    expect(
+        !prefix_range_end(ByteSequence::copy_from(
+            std::array<std::uint8_t, 3>{0xff, 0xff, 0xff}))
+             .has_value(),
+        "all-0xff prefix must have no finite upper bound");
+}
+
+void prefix_range_end_preserves_input() {
+    std::array<std::uint8_t, 3> input{0x01, 0xfe, 0xff};
+    const ByteSequence prefix = ByteSequence::copy_from(input);
+
+    static_cast<void>(prefix_range_end(prefix));
+
+    expect(
+        input == std::array<std::uint8_t, 3>{0x01, 0xfe, 0xff},
+        "prefix helper must not mutate caller input");
+    expect(
+        prefix
+            == ByteSequence::copy_from(
+                std::array<std::uint8_t, 3>{0x01, 0xfe, 0xff}),
+        "prefix helper must not mutate the ByteSequence");
 }
 
 void put_creates_and_updates_one_generation() {
@@ -235,6 +281,9 @@ void revision_exhaustion_does_not_partially_mutate() {
 int main() {
     const std::vector<std::pair<std::string, void (*)()>> tests{
         {"byte sequence", byte_sequences_copy_input_and_compare_unsigned},
+        {"binary prefix range", prefix_range_end_handles_binary_prefixes},
+        {"unbounded prefix range", prefix_range_end_reports_unbounded_prefixes},
+        {"prefix range immutability", prefix_range_end_preserves_input},
         {"put lifecycle", put_creates_and_updates_one_generation},
         {"erase lifecycle", erase_noop_does_not_advance_and_recreate_resets_version},
         {"compare and set", compare_and_set_uses_modification_revision},
