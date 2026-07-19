@@ -345,7 +345,7 @@ void leader_backtracks_and_does_not_commit() {
         leader.snapshot().peer_progress.at({2}).match_index == LogIndex{3}
             && leader.specification_state().volatile_state.commit_index
                 == LogIndex{},
-        "success must update matchIndex without advancing commit in slice 2");
+        "old-term match must update progress without direct commitment");
 }
 
 void lagging_follower_converges_under_reordered_requests() {

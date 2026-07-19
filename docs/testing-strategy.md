@@ -17,6 +17,9 @@
 - AppendEntries tests execute prefix mismatch, divergent suffix repair,
   duplicate/reordered delivery, retry, heartbeat, delayed log persistence,
   crash recovery, and three-/five-node replication schedules.
+- Commit/apply tests execute quorum thresholds, minority partitions, old-term
+  traps, follower bounds, ordered completion, backpressure, client
+  correlation, and applied-state recovery.
 - Linearizability tests analyze complete concurrent client histories.
 - Compatibility tests read every supported durable and protocol version.
 
@@ -41,6 +44,6 @@ seed, fault controls, and selected event history are printed and can be passed
 to `Simulator::replay`.
 
 The deterministic probe validates scheduling and every fault control. The
-Raft adapter additionally validates RequestVote and uncommitted AppendEntries
-replication; neither is evidence that committed consensus or a distributed
-service is implemented.
+Raft adapter additionally validates RequestVote, AppendEntries, majority
+commit, and ordered application. This is not evidence that ReadIndex,
+snapshots, or a distributed service is implemented.

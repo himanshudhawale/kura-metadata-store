@@ -11,6 +11,10 @@ It deliberately does not advance `commitIndex`, apply commands, complete client
 requests, install snapshots, change membership, or provide a production peer
 transport. Those guarantees require later slices, beginning with issue #13.
 
+Majority commit and ordered application were subsequently added by
+[Design 0012](0012-raft-commit-apply.md); this document retains the reviewed
+slice 2 boundary and rationale.
+
 ## Problem and why
 
 Election alone cannot make another node's log match the leader. Replication

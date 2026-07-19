@@ -31,14 +31,15 @@ Implemented now:
 - In-process backend adapter and deterministic uncertain-response fault seam
 - Deterministic AppendEntries heartbeats, conflict repair, leader
   nextIndex/matchIndex retry, and persistence-gated follower success
+- Current-term majority commitment, safe prior-term indirect commitment, and
+  ordered completion-driven state-machine apply
 
 Declared but not implemented:
 
 - Historical MVCC
 - Integration of state-machine commands with the WAL and snapshot body
 - Embedded durable backend
-- Majority commit/apply, production Raft transport, membership, snapshots, and
-  ReadIndex
+- Production Raft transport, membership, snapshots, and ReadIndex
 - Network server, authentication, and metrics
 - Remote client transport and real leader-failover integration
 

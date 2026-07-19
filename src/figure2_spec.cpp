@@ -401,6 +401,18 @@ void handle_append_entries(
         }
         if (term_at(result.state, index)
             != event.request.entries[incoming].term) {
+            if (index
+                <= result.state.volatile_state.commit_index.value) {
+                result.rules.push_back(
+                    RuleId::append_entries_reject_log_mismatch);
+                result.effects.push_back(SendAppendEntriesResponse{
+                    event.from,
+                    {
+                        result.state.persistent.current_term,
+                        false,
+                        {}}});
+                return;
+            }
             result.state.persistent.log.erase(
                 result.state.persistent.log.begin()
                     + static_cast<std::ptrdiff_t>(index - 1),
@@ -425,9 +437,12 @@ void handle_append_entries(
 
     const auto old_commit = result.state.volatile_state.commit_index;
     if (event.request.leader_commit > old_commit) {
-        result.state.volatile_state.commit_index = {
-            std::min(event.request.leader_commit.value, last_index(result.state))};
-        if (result.state.volatile_state.commit_index > old_commit) {
+        const auto last_new_index =
+            previous + event.request.entries.size();
+        const LogIndex bounded_commit{
+            std::min(event.request.leader_commit.value, last_new_index)};
+        if (bounded_commit > old_commit) {
+            result.state.volatile_state.commit_index = bounded_commit;
             result.rules.push_back(RuleId::append_entries_advance_commit);
         }
     }
