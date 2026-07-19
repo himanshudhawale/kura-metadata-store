@@ -24,6 +24,7 @@ add_library(
     kura_metadata
     src/byte_sequence.cpp
     src/durable_storage.cpp
+    src/figure2_spec.cpp
     src/key_range.cpp
     src/in_memory_metadata_store.cpp
     src/raft_simulation.cpp)
@@ -85,6 +86,22 @@ if(BUILD_TESTING)
     add_test(
         NAME kura_durable_storage_tests
         COMMAND kura_durable_storage_tests)
+
+    add_executable(
+        kura_figure2_spec_tests
+        tests/figure2_spec_test.cpp)
+
+    target_link_libraries(kura_figure2_spec_tests PRIVATE kura_metadata)
+
+    if(MSVC)
+        target_compile_options(kura_figure2_spec_tests PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(kura_figure2_spec_tests PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+
+    add_test(
+        NAME kura_figure2_spec_tests
+        COMMAND kura_figure2_spec_tests)
 
     add_executable(
         kura_raft_simulation_tests

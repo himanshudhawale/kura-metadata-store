@@ -114,6 +114,7 @@ not read a wall clock, and no background expiry driver is implemented.
 - [Brand assets and usage](docs/brand.md)
 - [Durable WAL and snapshot design](docs/design/0005-durable-wal-snapshots.md)
 - [Deterministic Raft simulator design](docs/design/0006-deterministic-raft-simulator.md)
+- [Executable Raft Figure 2 design](docs/design/0007-executable-raft-figure-2.md)
 - [WAL format v1](docs/formats/wal-v1.md)
 - [Snapshot format v1](docs/formats/snapshot-v1.md)
 

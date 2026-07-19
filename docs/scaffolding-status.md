@@ -20,13 +20,16 @@ Implemented now:
 - Dependency-free CRC32C, segmented WAL, and atomic snapshot storage boundary
 - Synchronized WAL append, strict prefix recovery, snapshot integrity
   discovery, and snapshot-covered conservative segment deletion
+- Executable Raft Figure 2 rule catalog, typed deterministic transitions,
+  ordered persistence/network/apply effects, and state-invariant validation
 
 Declared but not implemented:
 
 - Historical MVCC
 - Integration of state-machine commands with the WAL and snapshot body
 - Embedded durable backend
-- Raft and membership (the deterministic simulation harness exists; the
+- Production Raft node, membership, snapshots, and ReadIndex (the executable
+  Figure 2 specification and deterministic simulation harness exist; the
   consensus core does not)
 - Network server, authentication, and metrics
 - Remote client and Kura helper

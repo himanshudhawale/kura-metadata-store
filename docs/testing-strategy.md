@@ -8,6 +8,8 @@
 - Recovery tests interrupt every WAL and snapshot write boundary.
 - Concurrency tests exercise CAS, watch registration, lease expiry, and apply.
 - Simulation tests control time, messages, partitions, and node crashes.
+- Figure 2 catalog tests execute every rule and assert persistence-before-send
+  effect ordering.
 - Linearizability tests analyze complete concurrent client histories.
 - Compatibility tests read every supported durable and protocol version.
 
