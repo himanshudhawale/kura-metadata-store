@@ -56,7 +56,14 @@ using kura::metadata::PutResult;
 using kura::metadata::RangeRead;
 using kura::metadata::RangeRequest;
 using kura::metadata::RequestOperation;
+using kura::metadata::Revision;
+using kura::metadata::StatusCode;
+using kura::metadata::StoreError;
+using kura::metadata::StoreLimits;
 using kura::metadata::TransactionRequest;
+using kura::metadata::WatchFilter;
+using kura::metadata::WatchId;
+using kura::metadata::WatchRequest;
 using kura::metadata::prefix_range_end;
 
 class TestFailure final : public std::runtime_error {
@@ -124,6 +131,31 @@ TransactionRequest transaction_request(
         .comparisons = std::move(comparisons),
         .success = std::move(success),
         .failure = std::move(failure)};
+}
+
+WatchRequest exact_watch(
+    const std::int64_t id,
+    const std::string_view key,
+    const std::int64_t start_revision = 0,
+    const WatchFilter filter = WatchFilter::include_all,
+    const bool progress_notifications = false) {
+    return {
+        .id = WatchId{id},
+        .range = KeyRange{.start = bytes(key)},
+        .start_revision = Revision{start_revision},
+        .filter = filter,
+        .progress_notifications = progress_notifications};
+}
+
+WatchRequest range_watch(
+    const std::int64_t id,
+    const std::string_view start,
+    const std::string_view end,
+    const std::int64_t start_revision = 0) {
+    return {
+        .id = WatchId{id},
+        .range = key_range(start, end),
+        .start_revision = Revision{start_revision}};
 }
 
 void byte_sequences_copy_input_and_compare_unsigned() {
@@ -715,6 +747,264 @@ void concurrent_kura_publishers_have_one_winner() {
         "publication keys must share one revision");
 }
 
+void watches_select_exact_keys_and_ranges() {
+    InMemoryMetadataStore store;
+    static_cast<void>(store.create_watch(exact_watch(1, "a")));
+    static_cast<void>(store.create_watch(range_watch(2, "a", "c")));
+
+    static_cast<void>(store.put(bytes("a"), bytes("one")));
+    static_cast<void>(store.put(bytes("b"), bytes("two")));
+    static_cast<void>(store.put(bytes("c"), bytes("three")));
+
+    const auto exact = store.poll_watch(WatchId{1});
+    expect(exact && exact->events.size() == 1, "exact watch gets one event");
+    expect(
+        exact->events[0].mutation.current->key == bytes("a"),
+        "exact watch selects its key");
+    expect(!store.poll_watch(WatchId{1}), "exact watch excludes other keys");
+
+    const auto first = store.poll_watch(WatchId{2});
+    const auto second = store.poll_watch(WatchId{2});
+    expect(
+        first && second && first->header.revision == 1
+            && second->header.revision == 2,
+        "range watch preserves revision order");
+    expect(
+        first->events[0].mutation.current->key == bytes("a")
+            && second->events[0].mutation.current->key == bytes("b"),
+        "range watch uses a half-open interval");
+    expect(!store.poll_watch(WatchId{2}), "range watch excludes its end");
+}
+
+void watches_batch_transactions_and_resume() {
+    InMemoryMetadataStore store;
+    static_cast<void>(store.create_watch(range_watch(1, "a", "z")));
+    static_cast<void>(store.put(bytes("a"), bytes("one")));
+    const auto first = store.poll_watch(WatchId{1});
+    expect(first && first->header.revision == 1, "first revision delivered");
+    static_cast<void>(store.cancel_watch(WatchId{1}));
+
+    const auto transaction = store.transaction(transaction_request(
+        {},
+        {
+            transaction_put("b", "two"),
+            transaction_put("c", "three"),
+        }));
+    static_cast<void>(store.create_watch(
+        range_watch(2, "a", "z", first->header.revision + 1)));
+    const auto resumed = store.poll_watch(WatchId{2});
+    expect(
+        resumed && resumed->header.revision == transaction.header.revision,
+        "resume starts at last seen plus one");
+    expect(
+        resumed->events.size() == 2,
+        "one response contains the complete transaction batch");
+    expect(
+        resumed->events[0].mutation.current->key == bytes("b")
+            && resumed->events[1].mutation.current->key == bytes("c"),
+        "transaction events retain operation order");
+    expect(!store.poll_watch(WatchId{2}), "transaction batch is unique");
+}
+
+void watches_progress_filter_and_cancel() {
+    InMemoryMetadataStore store;
+    static_cast<void>(store.create_watch(exact_watch(
+        1,
+        "key",
+        0,
+        WatchFilter::exclude_put)));
+    static_cast<void>(store.put(bytes("key"), bytes("value")));
+    expect(!store.poll_watch(WatchId{1}), "put filter suppresses puts");
+    const auto erased = store.erase(bytes("key"));
+    expect(erased.deleted, "test erase mutates");
+    const auto event = store.poll_watch(WatchId{1});
+    expect(
+        event && event->events.size() == 1
+            && !event->events[0].mutation.current
+            && event->events[0].mutation.previous->value == bytes("value"),
+        "erase event carries immutable previous state");
+
+    store.request_watch_progress(WatchId{1});
+    const auto progress = store.poll_watch(WatchId{1});
+    expect(
+        progress && progress->events.empty()
+            && progress->header.revision == store.revision(),
+        "explicit progress bookmarks current delivered history");
+
+    static_cast<void>(store.create_watch(exact_watch(
+        2,
+        "missing",
+        0,
+        WatchFilter::include_all,
+        true)));
+    static_cast<void>(store.put(bytes("other"), bytes("value")));
+    const auto automatic_progress = store.poll_watch(WatchId{2});
+    expect(
+        automatic_progress && automatic_progress->events.empty()
+            && automatic_progress->header.revision == store.revision(),
+        "enabled progress notifications bookmark nonmatching revisions");
+    static_cast<void>(store.cancel_watch(WatchId{2}));
+
+    static_cast<void>(store.create_watch(exact_watch(
+        3,
+        "filter",
+        0,
+        WatchFilter::exclude_erase)));
+    static_cast<void>(store.put(bytes("filter"), bytes("value")));
+    expect(
+        store.poll_watch(WatchId{3})->events.size() == 1,
+        "erase filter includes puts");
+    static_cast<void>(store.erase(bytes("filter")));
+    expect(!store.poll_watch(WatchId{3}), "erase filter suppresses erases");
+    static_cast<void>(store.cancel_watch(WatchId{3}));
+
+    const auto cancelled = store.cancel_watch(WatchId{1});
+    expect(cancelled.cancelled, "cancellation returns a final response");
+    expect_throws<StoreError>(
+        [&store] {
+            static_cast<void>(store.poll_watch(WatchId{1}));
+        },
+        "cancelled watch is released");
+}
+
+void watches_report_compacted_and_future_revisions() {
+    StoreLimits limits;
+    limits.max_watch_history_revisions = 2;
+    InMemoryMetadataStore store(0, limits);
+    static_cast<void>(store.put(bytes("a"), bytes("1")));
+    static_cast<void>(store.put(bytes("b"), bytes("2")));
+    static_cast<void>(store.put(bytes("c"), bytes("3")));
+    expect(store.compact_revision() == 1, "history advances compaction boundary");
+
+    try {
+        static_cast<void>(
+            store.create_watch(range_watch(1, "a", "z", 1)));
+        throw TestFailure("compacted start must fail");
+    } catch (const StoreError& error) {
+        expect(
+            error.code() == StatusCode::compacted
+                && error.compact_revision() == 1,
+            "compacted error reports its boundary");
+    }
+    try {
+        static_cast<void>(
+            store.create_watch(range_watch(2, "a", "z", 5)));
+        throw TestFailure("future start must fail");
+    } catch (const StoreError& error) {
+        expect(
+            error.code() == StatusCode::future_revision,
+            "future revision has an explicit error");
+    }
+    static_cast<void>(
+        store.create_watch(range_watch(3, "a", "z", 4)));
+    expect(
+        !store.poll_watch(WatchId{3}),
+        "immediately following revision is a valid live cursor");
+}
+
+void watches_enforce_limits_and_backpressure() {
+    StoreLimits limits;
+    limits.max_watchers = 1;
+    limits.max_watch_pending_responses = 1;
+    limits.max_watch_history_revisions = 0;
+    InMemoryMetadataStore store(limits);
+    static_cast<void>(store.create_watch(range_watch(1, "a", "z")));
+    try {
+        static_cast<void>(store.create_watch(range_watch(2, "a", "z")));
+        throw TestFailure("watcher limit must fail");
+    } catch (const StoreError& error) {
+        expect(
+            error.code() == StatusCode::quota_exceeded,
+            "watcher limit reports quota exhaustion");
+    }
+
+    static_cast<void>(store.put(bytes("a"), bytes("1")));
+    static_cast<void>(store.put(bytes("b"), bytes("2")));
+    const auto terminal = store.poll_watch(WatchId{1});
+    expect(
+        terminal && terminal->cancelled
+            && terminal->status == StatusCode::quota_exceeded
+            && terminal->events.empty(),
+        "slow watcher is explicitly cancelled without a partial batch");
+    expect(
+        store.compact_revision() == 2,
+        "zero history retains no completed revision");
+}
+
+void concurrent_watch_delivery_is_ordered_and_unique() {
+    InMemoryMetadataStore store;
+    static_cast<void>(store.create_watch(range_watch(1, "k", "l")));
+    constexpr int writer_count = 32;
+    std::barrier start(writer_count + 1);
+    std::vector<std::future<PutResult>> writers;
+    writers.reserve(writer_count);
+    for (int index = 0; index < writer_count; ++index) {
+        writers.push_back(std::async(
+            std::launch::async,
+            [&store, &start, index] {
+                start.arrive_and_wait();
+                return store.put(
+                    bytes("k" + std::to_string(index)),
+                    bytes("value"));
+            }));
+    }
+    start.arrive_and_wait();
+    for (auto& writer : writers) {
+        static_cast<void>(writer.get());
+    }
+
+    for (std::int64_t revision = 1;
+         revision <= writer_count;
+         ++revision) {
+        const auto response = store.poll_watch(WatchId{1});
+        expect(response.has_value(), "every concurrent mutation is delivered");
+        expect(
+            response->header.revision == revision
+                && response->events.size() == 1
+                && response->events[0].revision.value == revision,
+            "concurrent delivery has no duplicate or reordered revision");
+    }
+    expect(!store.poll_watch(WatchId{1}), "concurrent delivery has no extras");
+}
+
+void failed_mutations_emit_no_watch_events() {
+    InMemoryMetadataStore store;
+    static_cast<void>(store.put(bytes("key"), bytes("value")));
+    static_cast<void>(store.create_watch(range_watch(1, "a", "z")));
+
+    const auto failed_cas =
+        store.compare_and_set(bytes("key"), 0, bytes("wrong"));
+    expect(!failed_cas.succeeded, "test CAS must fail");
+    expect(!store.erase(bytes("absent")).deleted, "test delete must be absent");
+    const auto failed_branch = store.transaction(transaction_request(
+        {Compare{
+            .key = bytes("key"),
+            .target = CompareTarget::value,
+            .result = CompareResult::equal,
+            .expected = bytes("wrong")}},
+        {transaction_put("leak", "value")}));
+    expect(!failed_branch.succeeded, "test comparison must fail");
+    const auto absent_transaction_delete = store.transaction(
+        transaction_request({}, {transaction_delete("x", "y")}));
+    expect(
+        std::get<DeleteRangeResult>(
+            absent_transaction_delete.responses[0]).deleted == 0,
+        "test transaction delete must be absent");
+    expect_throws<std::invalid_argument>(
+        [&store] {
+            static_cast<void>(store.transaction(transaction_request(
+                {},
+                {
+                    transaction_put("duplicate", "one"),
+                    transaction_put("duplicate", "two"),
+                })));
+        },
+        "test transaction must be rejected");
+    expect(
+        !store.poll_watch(WatchId{1}),
+        "failed and no-op mutations emit no watch event");
+}
+
 }  // namespace
 
 int main() {
@@ -740,7 +1030,14 @@ int main() {
         {"transaction duplicate writes", duplicate_transaction_writes_are_rejected},
         {"transaction atomic validation", invalid_selected_transaction_is_atomic},
         {"transaction overflow", transaction_overflow_is_atomic},
-        {"concurrent transaction publishers", concurrent_kura_publishers_have_one_winner}};
+        {"concurrent transaction publishers", concurrent_kura_publishers_have_one_winner},
+        {"watch key and range", watches_select_exact_keys_and_ranges},
+        {"watch transaction resume", watches_batch_transactions_and_resume},
+        {"watch progress filter cancel", watches_progress_filter_and_cancel},
+        {"watch revision errors", watches_report_compacted_and_future_revisions},
+        {"watch limits", watches_enforce_limits_and_backpressure},
+        {"watch concurrent delivery", concurrent_watch_delivery_is_ordered_and_unique},
+        {"watch failed mutations", failed_mutations_emit_no_watch_events}};
 
     int failures = 0;
     for (const auto& [name, test] : tests) {
