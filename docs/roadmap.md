@@ -73,6 +73,11 @@ This phase is durable but remains single-node and not highly available.
 
 ## Phase 4: Raft replication
 
+**Status:** Started. Deterministic follower/candidate election and RequestVote
+behavior are implemented as the first internal core slice. AppendEntries,
+replication, commitment, and distributed service integration remain
+unimplemented.
+
 Deliver:
 
 - Internal Raft implementation derived from the paper and dissertation

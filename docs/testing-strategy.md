@@ -12,6 +12,8 @@
 - Simulation tests control time, messages, partitions, and node crashes.
 - Figure 2 catalog tests execute every rule and assert hard-state completion
   correlation plus persistence-before-send ordering.
+- Election-core tests execute seeded deadlines, split votes, vote freshness,
+  persistence delays, restart, duplicate grants, and odd-cluster schedules.
 - Linearizability tests analyze complete concurrent client histories.
 - Compatibility tests read every supported durable and protocol version.
 
@@ -35,5 +37,7 @@ must use `Simulator::require` (or propagate an adapter failure) so its `sim-v1`
 seed, fault controls, and selected event history are printed and can be passed
 to `Simulator::replay`.
 
-The current deterministic probe validates scheduling and every fault control;
-it is not evidence that leader election or consensus is implemented.
+The deterministic probe validates scheduling and every fault control. The
+election adapter additionally validates the RequestVote-only slice; neither is
+evidence that log replication, committed consensus, or a distributed service
+is implemented.

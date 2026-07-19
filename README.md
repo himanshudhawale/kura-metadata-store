@@ -17,8 +17,9 @@ WAL, networking, and state-machine execution.
 > **Current status:** Phase 1 is a single-node, in-memory deterministic state
 > machine. Phase 3 WAL/snapshot storage and atomic Raft term/vote persistence
 > boundaries exist but are not connected to mutation responses. A deterministic
-> logical-time Raft simulator and executable Figure 2 specification exist, but
-> the production Raft core does not. The service is not distributed,
+> logical-time Raft simulator, executable Figure 2 specification, and an
+> internal RequestVote-only election core exist, but replication and the
+> production Raft service do not. The service is not distributed,
 > replicated, durably integrated, or highly available. Do not use it for
 > production metadata.
 
@@ -117,6 +118,7 @@ not read a wall clock, and no background expiry driver is implemented.
 - [Deterministic Raft simulator design](docs/design/0006-deterministic-raft-simulator.md)
 - [Executable Raft Figure 2 design](docs/design/0007-executable-raft-figure-2.md)
 - [Raft hard-state persistence design](docs/design/0008-raft-hard-state-persistence.md)
+- [Deterministic Raft election design](docs/design/0009-raft-election-core.md)
 - [WAL format v1](docs/formats/wal-v1.md)
 - [Snapshot format v1](docs/formats/snapshot-v1.md)
 - [Raft hard-state format v1](docs/formats/raft-hard-state-v1.md)

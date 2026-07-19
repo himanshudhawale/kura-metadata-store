@@ -25,6 +25,7 @@ add_library(
     src/byte_sequence.cpp
     src/durable_storage.cpp
     src/figure2_spec.cpp
+    src/raft_election.cpp
     src/raft_hard_state_store.cpp
     src/key_range.cpp
     src/in_memory_metadata_store.cpp
@@ -135,4 +136,20 @@ if(BUILD_TESTING)
     add_test(
         NAME kura_raft_hard_state_tests
         COMMAND kura_raft_hard_state_tests)
+
+    add_executable(
+        kura_raft_election_tests
+        tests/raft_election_test.cpp)
+
+    target_link_libraries(kura_raft_election_tests PRIVATE kura_metadata)
+
+    if(MSVC)
+        target_compile_options(kura_raft_election_tests PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(kura_raft_election_tests PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+
+    add_test(
+        NAME kura_raft_election_tests
+        COMMAND kura_raft_election_tests)
 endif()

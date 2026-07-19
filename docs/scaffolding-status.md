@@ -24,15 +24,16 @@ Implemented now:
   ordered persistence/network/apply effects, and state-invariant validation
 - Atomic, checksummed Raft term/vote storage with explicit durable-completion
   events and deterministic write-boundary fault injection
+- Deterministic follower/candidate election core with seeded logical
+  deadlines, RequestVote, persistence-gated sends, and simulator adapter
 
 Declared but not implemented:
 
 - Historical MVCC
 - Integration of state-machine commands with the WAL and snapshot body
 - Embedded durable backend
-- Production Raft node, membership, snapshots, and ReadIndex (the executable
-  Figure 2 specification and deterministic simulation harness exist; the
-  consensus core does not)
+- AppendEntries, replicated commit/apply, production Raft transport,
+  membership, snapshots, and ReadIndex
 - Network server, authentication, and metrics
 - Remote client and Kura helper
 
