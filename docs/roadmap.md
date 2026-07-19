@@ -69,6 +69,7 @@ This phase is durable but remains single-node and not highly available.
 
 Deliver:
 
+- Internal Raft implementation derived from the paper and dissertation
 - Terms, votes, elections, and AppendEntries
 - Persistent Raft state before peer acknowledgement
 - Majority commit and ordered apply
@@ -83,6 +84,10 @@ Exit criteria:
 - A partitioned old leader cannot serve a linearizable read.
 - Histories pass a linearizability checker.
 - Only this phase may introduce distributed and high-availability claims.
+
+The consensus core will not depend on NuRaft or another Raft implementation.
+It will expose deterministic input/output events so election, replication,
+persistence ordering, and partitions can be simulated without real timing.
 
 ## Phase 5: Membership and operations
 

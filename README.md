@@ -97,6 +97,7 @@ snapshot becomes current. See [Kura integration](docs/kura-integration.md).
 - [Research sources](docs/research-sources.md)
 - [ADR-0001: phase claims](docs/decisions/0001-phase-claims.md)
 - [ADR-0002: C++23 implementation](docs/decisions/0002-cpp23-implementation.md)
+- [ADR-0003: internal Raft implementation](docs/decisions/0003-internal-raft.md)
 
 ## Build
 
