@@ -8,6 +8,10 @@ odd-sized clusters. It does not implement AppendEntries, log replication,
 commitment, state-machine application, membership changes, peer transport, or
 production service integration.
 
+AppendEntries was subsequently added by
+[Design 0011](0011-raft-append-entries.md); this document retains the reviewed
+slice 1 boundary and rationale.
+
 ## Problem and why
 
 An election must make the same decision for the same ordered inputs, while

@@ -10,6 +10,8 @@ struct LogEntry {
     Term term;
     LogIndex index;
     CommandEnvelope command;
+
+    bool operator==(const LogEntry&) const = default;
 };
 
 }  // namespace kura::metadata
