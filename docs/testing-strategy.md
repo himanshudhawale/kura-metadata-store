@@ -26,7 +26,12 @@
 - Raft snapshot tests execute publication/restore ordering, durable WAL
   truncation gates, integrity and transfer checks, crash recovery, suffix
   resumption, pending-read safety, and three-/five-node catch-up schedules.
-- Linearizability tests analyze complete concurrent client histories.
+- Linearizability tests check typed get/put/erase/CAS intervals and revisions,
+  malformed histories, uncertainty, deterministic counterexamples, replay,
+  pruning, and explicit resource-limit outcomes.
+- Parent Raft acceptance tests compose the real node adapter across
+  three-/five-node healthy, minority, former-leader, crash/restart, message
+  fault, ReadIndex, and snapshot catch-up schedules.
 - Compatibility tests read every supported durable and protocol version.
 
 ## Required tool configurations
@@ -53,3 +58,6 @@ The deterministic probe validates scheduling and every fault control. The
 Raft adapter additionally validates RequestVote, AppendEntries, majority
 commit, ordered application, ReadIndex, and snapshot installation. This is not
 evidence that a production distributed service is implemented.
+
+Parent acceptance failures include both the simulator's replayable `sim-v1`
+trace and, for history violations, canonical `linear-history-v1` input.

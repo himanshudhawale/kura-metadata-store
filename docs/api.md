@@ -369,3 +369,24 @@ Details are in [Design 0009](design/0009-raft-election-core.md),
 [Design 0012](design/0012-raft-commit-apply.md), and
 [Design 0013](design/0013-raft-read-index.md), and
 [Design 0014](design/0014-raft-snapshots.md).
+
+## 11. Linearizability history-checking boundary
+
+The testing API records separate typed invocations and completions for get,
+put, erase, and compare-and-swap. Records carry unique operation/client IDs,
+logical interval endpoints, values, revisions, typed results, and one of
+`succeeded`, `failed`, `timed_out`, or `indeterminate`. Pending invocations are
+allowed.
+
+```text
+check(history, limits) -> linearizable | not_linearizable | inconclusive
+serialize(history)     -> canonical linear-history-v1 text
+parse(text)            -> validated typed history
+```
+
+The checker respects real-time precedence and the revisioned sequential model,
+memoizes deterministic search states, and never converts a search limit into
+success. Definitive failures include a one-operation-minimal typed and textual
+counterexample. The model starts empty at revision zero and currently covers
+only the four listed metadata operations; it is test infrastructure, not a
+public client consistency API. See [Design 0015](design/0015-raft-acceptance-linearizability.md).

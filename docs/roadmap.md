@@ -73,10 +73,11 @@ This phase is durable but remains single-node and not highly available.
 
 ## Phase 4: Raft replication
 
-**Status:** Started. Deterministic elections, RequestVote, AppendEntries log
-replication, majority commitment, ordered application, quorum-confirmed
-ReadIndex, and snapshot installation are implemented in the first five
-internal core slices. Distributed service integration remains unimplemented.
+**Status:** Deterministic core acceptance complete for issue #6. Elections,
+RequestVote, AppendEntries, majority commitment, ordered application,
+quorum-confirmed ReadIndex, snapshot installation, faulted three-/five-node
+simulation, and bounded history checking are implemented. Phase 4 production
+service integration remains in progress and no availability claim is made.
 
 Deliver:
 
@@ -95,6 +96,11 @@ Exit criteria:
 - A partitioned old leader cannot serve a linearizable read.
 - Histories pass a linearizability checker.
 - Only this phase may introduce distributed and high-availability claims.
+
+The first three exit criteria are accepted for the deterministic core test
+boundary. The last remains intentionally unmet for the product: production
+transport, server integration, durable state-machine wiring, membership, and
+operations must exist before distributed or high-availability claims.
 
 The consensus core will not depend on NuRaft or another Raft implementation.
 It will expose deterministic input/output events so election, replication,

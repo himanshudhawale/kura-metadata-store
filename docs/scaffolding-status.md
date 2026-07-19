@@ -37,6 +37,12 @@ Implemented now:
   applied-index gating, explicit uncertainty, and bounded pending reads
 - Canonical applied-state Raft snapshots, publication-gated log compaction,
   whole-snapshot InstallSnapshot, and lagging-follower suffix resumption
+- Sound bounded get/put/erase/CAS history checking with strict validation,
+  deterministic search, explicit inconclusive results, and replayable
+  one-minimal counterexamples
+- End-to-end deterministic Raft-core acceptance under election, persistence,
+  partition, delay, duplication, reordering, crash, restart, ReadIndex, and
+  snapshot catch-up schedules in three- and five-voter clusters
 
 Declared but not implemented:
 
@@ -46,6 +52,8 @@ Declared but not implemented:
 - Production Raft transport and membership changes
 - Network server, authentication, and metrics
 - Remote client transport and real leader-failover integration
+- Production client-history capture and full transaction/watch/lease
+  linearizability models
 
 Scaffolding must not be used as evidence of availability, durability,
 linearizability across nodes, or production readiness.

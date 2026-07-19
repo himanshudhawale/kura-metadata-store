@@ -29,6 +29,7 @@ add_library(
     src/raft_hard_state_store.cpp
     src/kura_client.cpp
     src/key_range.cpp
+    src/linearizability.cpp
     src/in_memory_metadata_store.cpp
     src/raft_simulation.cpp)
 
@@ -231,4 +232,36 @@ if(BUILD_TESTING)
     add_test(
         NAME kura_raft_snapshot_tests
         COMMAND kura_raft_snapshot_tests)
+
+    add_executable(
+        kura_linearizability_tests
+        tests/linearizability_test.cpp)
+
+    target_link_libraries(kura_linearizability_tests PRIVATE kura_metadata)
+
+    if(MSVC)
+        target_compile_options(kura_linearizability_tests PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(kura_linearizability_tests PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+
+    add_test(
+        NAME kura_linearizability_tests
+        COMMAND kura_linearizability_tests)
+
+    add_executable(
+        kura_raft_acceptance_tests
+        tests/raft_acceptance_test.cpp)
+
+    target_link_libraries(kura_raft_acceptance_tests PRIVATE kura_metadata)
+
+    if(MSVC)
+        target_compile_options(kura_raft_acceptance_tests PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(kura_raft_acceptance_tests PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+
+    add_test(
+        NAME kura_raft_acceptance_tests
+        COMMAND kura_raft_acceptance_tests)
 endif()
