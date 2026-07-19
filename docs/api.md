@@ -169,9 +169,28 @@ Design and edge cases are documented in
 
 ## 5. Watch
 
-A watch subscribes to a key or range starting at a revision.
+The in-memory store provides a Phase 2 in-process watch subsystem:
 
-Required guarantees:
+```text
+create_watch(request)        -> creation response
+poll_watch(id)               -> optional next response
+request_watch_progress(id)   -> queues a progress response
+cancel_watch(id)             -> cancelled response
+compact_revision()           -> current event-history boundary
+```
+
+Polling is non-blocking. A watch uses a positive, caller-assigned ID. An empty
+range end selects the exact non-empty start key; otherwise the range is
+half-open `[start, end)`. Filters can exclude puts or erases. Put events contain
+current and optional previous state. Erase events contain previous state and
+no current value.
+
+The inclusive start revision may be a retained revision or exactly the next
+revision for a live watch. Zero means that next revision. Older starts fail
+with `StatusCode::compacted` and the explicit compaction revision; starts
+beyond the next revision fail with `StatusCode::future_revision`.
+
+The implementation guarantees:
 
 - Ordered by revision
 - No duplicate event within one watch
@@ -180,9 +199,22 @@ Required guarantees:
 - Resumable from `lastSeenRevision + 1`
 - Progress notifications that bookmark delivered history
 
-If the requested history was compacted, the server reports the compaction
-revision. The client performs a full current range read and resumes watching
-from that response's revision.
+An explicit progress request is ordered behind pending events. Enabling
+`progress_notifications` also emits an empty response for applied revisions
+with no matching event.
+
+`StoreLimits` bounds active watchers, retained revision batches, and pending
+responses per watcher. Replay that cannot fit is rejected. Live backpressure
+does not block mutation: the slow watch drops its pending queue and returns one
+terminal cancelled response with `StatusCode::quota_exceeded`. History removes
+whole oldest batches and advances the compaction boundary.
+
+If requested history was compacted, the client performs a full current range
+read and resumes at that response's revision plus one. Event history does not
+provide historical value reads or persistence.
+
+Design rationale and edge cases are documented in
+[Design 0003: Resumable in-process watch streams](design/0003-resumable-watch-streams.md).
 
 ## 6. Lease
 

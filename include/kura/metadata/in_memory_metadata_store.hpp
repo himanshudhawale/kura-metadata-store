@@ -1,11 +1,17 @@
 #pragma once
 
+#include "kura/metadata/core/limits.hpp"
+#include "kura/metadata/core/clock.hpp"
 #include "kura/metadata/kv/transaction_request.hpp"
 #include "kura/metadata/kv/transaction_result.hpp"
 #include "kura/metadata/lease/lease_snapshot.hpp"
 #include "kura/metadata/metadata_store.hpp"
+#include "kura/metadata/watch/watch_request.hpp"
+#include "kura/metadata/watch/watch_response.hpp"
 
 #include <cstdint>
+#include <chrono>
+#include <deque>
 #include <map>
 #include <set>
 #include <shared_mutex>
@@ -15,11 +21,16 @@ namespace kura::metadata {
 
 class InMemoryMetadataStore final : public MetadataStore {
 public:
-    explicit InMemoryMetadataStore(std::int64_t initial_revision = 0);
+    explicit InMemoryMetadataStore(
+        std::int64_t initial_revision = 0,
+        StoreLimits limits = {});
+
+    explicit InMemoryMetadataStore(StoreLimits limits);
 
     InMemoryMetadataStore(
         std::vector<KeyValue> initial_values,
-        std::int64_t initial_revision);
+        std::int64_t initial_revision,
+        StoreLimits limits = {});
 
     explicit InMemoryMetadataStore(InMemoryStoreSnapshot snapshot);
 

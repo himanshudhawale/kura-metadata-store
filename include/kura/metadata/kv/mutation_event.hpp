@@ -13,7 +13,7 @@ enum class MutationEventType {
 
 struct MutationEvent {
     MutationEventType type;
-    KeyValue current;
+    std::optional<KeyValue> current;
     std::optional<KeyValue> previous;
 };
 

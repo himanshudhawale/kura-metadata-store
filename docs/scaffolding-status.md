@@ -15,6 +15,9 @@ Implemented now:
 - Fenced transaction ownership, key attachment, and atomic cascade deletion
 - Canonical in-memory key/lease snapshot representation
 - Synchronized concurrent access
+- Dependency-free CRC32C, segmented WAL, and atomic snapshot storage boundary
+- Synchronized WAL append, strict prefix recovery, snapshot integrity
+  discovery, and snapshot-covered conservative segment deletion
 
 Declared but not implemented:
 

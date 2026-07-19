@@ -1,6 +1,9 @@
 #include "kura/metadata/in_memory_metadata_store.hpp"
 
+#include "kura/metadata/core/store_error.hpp"
+
 #include <algorithm>
+#include <chrono>
 #include <limits>
 #include <mutex>
 #include <ranges>
@@ -52,17 +55,26 @@ bool comparison_matches(
 }  // namespace
 
 InMemoryMetadataStore::InMemoryMetadataStore(
-    const std::int64_t initial_revision)
-    : revision_(initial_revision) {
+    const std::int64_t initial_revision,
+    StoreLimits limits)
+    : limits_(limits),
+      revision_(initial_revision),
+      compact_revision_(initial_revision) {
     if (initial_revision < 0) {
         throw std::invalid_argument("initial revision must not be negative");
     }
 }
 
+InMemoryMetadataStore::InMemoryMetadataStore(StoreLimits limits)
+    : InMemoryMetadataStore(0, limits) {}
+
 InMemoryMetadataStore::InMemoryMetadataStore(
     std::vector<KeyValue> initial_values,
-    const std::int64_t initial_revision)
-    : revision_(initial_revision) {
+    const std::int64_t initial_revision,
+    StoreLimits limits)
+    : limits_(limits),
+      revision_(initial_revision),
+      compact_revision_(initial_revision) {
     if (initial_revision < 0) {
         throw std::invalid_argument("initial revision must not be negative");
     }
@@ -206,6 +218,7 @@ DeleteResult InMemoryMetadataStore::erase(const ByteSequence& key) {
     detach_key_locked(previous);
     values_.erase(iterator);
     revision_ = mutation_revision;
+    commit_watch_publication_locked(publication);
     return {
         .deleted = true,
         .previous = std::move(previous),
@@ -419,6 +432,7 @@ TransactionResult InMemoryMetadataStore::transaction(
     std::map<LeaseId, StoredLease> working_leases = leases_;
     std::vector<TransactionOperationResult> responses;
     responses.reserve(operations.size());
+    std::vector<WatchEvent> events;
 
     for (const RequestOperation& operation : operations) {
         std::visit(
@@ -473,6 +487,12 @@ TransactionResult InMemoryMetadataStore::transaction(
                             typed_operation.key,
                             current);
                     static_cast<void>(inserted);
+                    events.push_back(WatchEvent{
+                        .revision = Revision{transaction_revision},
+                        .mutation = MutationEvent{
+                            .type = MutationEventType::put,
+                            .current = stored->second,
+                            .previous = previous}});
                     responses.emplace_back(PutResult{
                         .current = stored->second,
                         .previous = typed_operation.return_previous
@@ -488,8 +508,14 @@ TransactionResult InMemoryMetadataStore::transaction(
                            && iterator->first < typed_operation.range.end) {
                         detach_key(working_leases, iterator->second);
                         if (typed_operation.return_previous) {
-                            previous.push_back(iterator->second);
+                            previous.push_back(erased);
                         }
+                        events.push_back(WatchEvent{
+                            .revision = Revision{transaction_revision},
+                            .mutation = MutationEvent{
+                                .type = MutationEventType::erase,
+                                .current = std::nullopt,
+                                .previous = erased}});
                         iterator = working.erase(iterator);
                         ++deleted;
                     }
@@ -502,6 +528,11 @@ TransactionResult InMemoryMetadataStore::transaction(
             operation);
     }
 
+    std::optional<StagedWatchPublication> publication;
+    if (has_effective_mutation) {
+        publication =
+            stage_watch_publication_locked(events, transaction_revision);
+    }
     values_.swap(working);
     leases_.swap(working_leases);
     revision_ = transaction_revision;
@@ -663,7 +694,52 @@ InMemoryStoreSnapshot InMemoryMetadataStore::snapshot() const {
 
 std::int64_t InMemoryMetadataStore::revision() const {
     const std::shared_lock lock(mutex_);
-    return revision_;
+    const auto iterator = leases_.find(id);
+    if (iterator == leases_.end()) {
+        throw StoreError(
+            StatusCode::lease_not_found,
+            "unknown lease");
+    }
+    return {
+        .header = ResponseHeader{.revision = revision_},
+        .lease = LeaseRecord{
+            .id = id,
+            .granted_ttl = iterator->second.granted_ttl,
+            .remaining_ttl = remaining_ttl(iterator->second, now)}};
+}
+
+LeaseResponse InMemoryMetadataStore::revoke_lease(
+    const LeaseRevokeRequest& request) {
+    const std::unique_lock lock(mutex_);
+    const auto iterator = leases_.find(request.id);
+    if (iterator == leases_.end()) {
+        throw StoreError(
+            StatusCode::lease_not_found,
+            "cannot revoke an unknown lease");
+    }
+    return remove_leases_locked(
+        {request.id},
+        request.id,
+        iterator->second.granted_ttl);
+}
+
+std::size_t InMemoryMetadataStore::expire_leases(
+    const Clock::TimePoint now) {
+    const std::unique_lock lock(mutex_);
+    std::vector<LeaseId> expired;
+    for (const auto& [id, lease] : leases_) {
+        if (lease.deadline <= now) {
+            expired.push_back(id);
+        }
+    }
+    if (expired.empty()) {
+        return 0;
+    }
+    static_cast<void>(remove_leases_locked(
+        expired,
+        expired.front(),
+        leases_.at(expired.front()).granted_ttl));
+    return expired.size();
 }
 
 PutResult InMemoryMetadataStore::put_locked(
@@ -694,14 +770,16 @@ PutResult InMemoryMetadataStore::put_locked(
         .mod_revision = mutation_revision,
         .lease_id = 0};
 
-    const auto [stored, inserted] = values_.insert_or_assign(key, current);
+    std::map<ByteSequence, KeyValue> working = values_;
+    const auto [stored, inserted] = working.insert_or_assign(key, current);
     static_cast<void>(inserted);
     if (previous.has_value()) {
         detach_key_locked(*previous);
     }
     revision_ = mutation_revision;
+    commit_watch_publication_locked(publication);
     return {
-        .current = stored->second,
+        .current = std::move(current),
         .previous = std::move(previous),
         .revision = mutation_revision};
 }

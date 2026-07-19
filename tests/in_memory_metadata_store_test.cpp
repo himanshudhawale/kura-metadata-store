@@ -16,6 +16,7 @@
 #include "kura/metadata/kv/compare.hpp"
 #include "kura/metadata/kv/transaction_request.hpp"
 #include "kura/metadata/kv/transaction_result.hpp"
+#include "kura/metadata/lease/lease_request.hpp"
 #include "kura/metadata/lease/lease_scheduler.hpp"
 #include "kura/metadata/raft/raft_node.hpp"
 #include "kura/metadata/raft/snapshot_metadata.hpp"
@@ -29,6 +30,7 @@
 
 #include <array>
 #include <barrier>
+#include <chrono>
 #include <cstdint>
 #include <exception>
 #include <future>
@@ -67,7 +69,14 @@ using kura::metadata::PutResult;
 using kura::metadata::RangeRead;
 using kura::metadata::RangeRequest;
 using kura::metadata::RequestOperation;
+using kura::metadata::Revision;
+using kura::metadata::StatusCode;
+using kura::metadata::StoreError;
+using kura::metadata::StoreLimits;
 using kura::metadata::TransactionRequest;
+using kura::metadata::WatchFilter;
+using kura::metadata::WatchId;
+using kura::metadata::WatchRequest;
 using kura::metadata::prefix_range_end;
 
 class TestFailure final : public std::runtime_error {
@@ -141,6 +150,31 @@ TransactionRequest transaction_request(
         .lease_tick = lease_tick,
         .success = std::move(success),
         .failure = std::move(failure)};
+}
+
+WatchRequest exact_watch(
+    const std::int64_t id,
+    const std::string_view key,
+    const std::int64_t start_revision = 0,
+    const WatchFilter filter = WatchFilter::include_all,
+    const bool progress_notifications = false) {
+    return {
+        .id = WatchId{id},
+        .range = KeyRange{.start = bytes(key)},
+        .start_revision = Revision{start_revision},
+        .filter = filter,
+        .progress_notifications = progress_notifications};
+}
+
+WatchRequest range_watch(
+    const std::int64_t id,
+    const std::string_view start,
+    const std::string_view end,
+    const std::int64_t start_revision = 0) {
+    return {
+        .id = WatchId{id},
+        .range = key_range(start, end),
+        .start_revision = Revision{start_revision}};
 }
 
 void byte_sequences_copy_input_and_compare_unsigned() {
@@ -1085,6 +1119,412 @@ void concurrent_kura_publishers_have_one_winner() {
                    .value->mod_revision
                 == 2,
         "publication keys must share one revision");
+}
+
+void watches_select_exact_keys_and_ranges() {
+    InMemoryMetadataStore store;
+    static_cast<void>(store.create_watch(exact_watch(1, "a")));
+    static_cast<void>(store.create_watch(range_watch(2, "a", "c")));
+
+    static_cast<void>(store.put(bytes("a"), bytes("one")));
+    static_cast<void>(store.put(bytes("b"), bytes("two")));
+    static_cast<void>(store.put(bytes("c"), bytes("three")));
+
+    const auto exact = store.poll_watch(WatchId{1});
+    expect(exact && exact->events.size() == 1, "exact watch gets one event");
+    expect(
+        exact->events[0].mutation.current->key == bytes("a"),
+        "exact watch selects its key");
+    expect(!store.poll_watch(WatchId{1}), "exact watch excludes other keys");
+
+    const auto first = store.poll_watch(WatchId{2});
+    const auto second = store.poll_watch(WatchId{2});
+    expect(
+        first && second && first->header.revision == 1
+            && second->header.revision == 2,
+        "range watch preserves revision order");
+    expect(
+        first->events[0].mutation.current->key == bytes("a")
+            && second->events[0].mutation.current->key == bytes("b"),
+        "range watch uses a half-open interval");
+    expect(!store.poll_watch(WatchId{2}), "range watch excludes its end");
+}
+
+void watches_batch_transactions_and_resume() {
+    InMemoryMetadataStore store;
+    static_cast<void>(store.create_watch(range_watch(1, "a", "z")));
+    static_cast<void>(store.put(bytes("a"), bytes("one")));
+    const auto first = store.poll_watch(WatchId{1});
+    expect(first && first->header.revision == 1, "first revision delivered");
+    static_cast<void>(store.cancel_watch(WatchId{1}));
+
+    const auto transaction = store.transaction(transaction_request(
+        {},
+        {
+            transaction_put("b", "two"),
+            transaction_put("c", "three"),
+        }));
+    static_cast<void>(store.create_watch(
+        range_watch(2, "a", "z", first->header.revision + 1)));
+    const auto resumed = store.poll_watch(WatchId{2});
+    expect(
+        resumed && resumed->header.revision == transaction.header.revision,
+        "resume starts at last seen plus one");
+    expect(
+        resumed->events.size() == 2,
+        "one response contains the complete transaction batch");
+    expect(
+        resumed->events[0].mutation.current->key == bytes("b")
+            && resumed->events[1].mutation.current->key == bytes("c"),
+        "transaction events retain operation order");
+    expect(!store.poll_watch(WatchId{2}), "transaction batch is unique");
+}
+
+void watches_progress_filter_and_cancel() {
+    InMemoryMetadataStore store;
+    static_cast<void>(store.create_watch(exact_watch(
+        1,
+        "key",
+        0,
+        WatchFilter::exclude_put)));
+    static_cast<void>(store.put(bytes("key"), bytes("value")));
+    expect(!store.poll_watch(WatchId{1}), "put filter suppresses puts");
+    const auto erased = store.erase(bytes("key"));
+    expect(erased.deleted, "test erase mutates");
+    const auto event = store.poll_watch(WatchId{1});
+    expect(
+        event && event->events.size() == 1
+            && !event->events[0].mutation.current
+            && event->events[0].mutation.previous->value == bytes("value"),
+        "erase event carries immutable previous state");
+
+    store.request_watch_progress(WatchId{1});
+    const auto progress = store.poll_watch(WatchId{1});
+    expect(
+        progress && progress->events.empty()
+            && progress->header.revision == store.revision(),
+        "explicit progress bookmarks current delivered history");
+
+    static_cast<void>(store.create_watch(exact_watch(
+        2,
+        "missing",
+        0,
+        WatchFilter::include_all,
+        true)));
+    static_cast<void>(store.put(bytes("other"), bytes("value")));
+    const auto automatic_progress = store.poll_watch(WatchId{2});
+    expect(
+        automatic_progress && automatic_progress->events.empty()
+            && automatic_progress->header.revision == store.revision(),
+        "enabled progress notifications bookmark nonmatching revisions");
+    static_cast<void>(store.cancel_watch(WatchId{2}));
+
+    static_cast<void>(store.create_watch(exact_watch(
+        3,
+        "filter",
+        0,
+        WatchFilter::exclude_erase)));
+    static_cast<void>(store.put(bytes("filter"), bytes("value")));
+    expect(
+        store.poll_watch(WatchId{3})->events.size() == 1,
+        "erase filter includes puts");
+    static_cast<void>(store.erase(bytes("filter")));
+    expect(!store.poll_watch(WatchId{3}), "erase filter suppresses erases");
+    static_cast<void>(store.cancel_watch(WatchId{3}));
+
+    const auto cancelled = store.cancel_watch(WatchId{1});
+    expect(cancelled.cancelled, "cancellation returns a final response");
+    expect_throws<StoreError>(
+        [&store] {
+            static_cast<void>(store.poll_watch(WatchId{1}));
+        },
+        "cancelled watch is released");
+}
+
+void watches_report_compacted_and_future_revisions() {
+    StoreLimits limits;
+    limits.max_watch_history_revisions = 2;
+    InMemoryMetadataStore store(0, limits);
+    static_cast<void>(store.put(bytes("a"), bytes("1")));
+    static_cast<void>(store.put(bytes("b"), bytes("2")));
+    static_cast<void>(store.put(bytes("c"), bytes("3")));
+    expect(store.compact_revision() == 1, "history advances compaction boundary");
+
+    try {
+        static_cast<void>(
+            store.create_watch(range_watch(1, "a", "z", 1)));
+        throw TestFailure("compacted start must fail");
+    } catch (const StoreError& error) {
+        expect(
+            error.code() == StatusCode::compacted
+                && error.compact_revision() == 1,
+            "compacted error reports its boundary");
+    }
+    try {
+        static_cast<void>(
+            store.create_watch(range_watch(2, "a", "z", 5)));
+        throw TestFailure("future start must fail");
+    } catch (const StoreError& error) {
+        expect(
+            error.code() == StatusCode::future_revision,
+            "future revision has an explicit error");
+    }
+    static_cast<void>(
+        store.create_watch(range_watch(3, "a", "z", 4)));
+    expect(
+        !store.poll_watch(WatchId{3}),
+        "immediately following revision is a valid live cursor");
+}
+
+void watches_enforce_limits_and_backpressure() {
+    StoreLimits limits;
+    limits.max_watchers = 1;
+    limits.max_watch_pending_responses = 1;
+    limits.max_watch_history_revisions = 0;
+    InMemoryMetadataStore store(limits);
+    static_cast<void>(store.create_watch(range_watch(1, "a", "z")));
+    try {
+        static_cast<void>(store.create_watch(range_watch(2, "a", "z")));
+        throw TestFailure("watcher limit must fail");
+    } catch (const StoreError& error) {
+        expect(
+            error.code() == StatusCode::quota_exceeded,
+            "watcher limit reports quota exhaustion");
+    }
+
+    static_cast<void>(store.put(bytes("a"), bytes("1")));
+    static_cast<void>(store.put(bytes("b"), bytes("2")));
+    const auto terminal = store.poll_watch(WatchId{1});
+    expect(
+        terminal && terminal->cancelled
+            && terminal->status == StatusCode::quota_exceeded
+            && terminal->events.empty(),
+        "slow watcher is explicitly cancelled without a partial batch");
+    expect(
+        store.compact_revision() == 2,
+        "zero history retains no completed revision");
+}
+
+void concurrent_watch_delivery_is_ordered_and_unique() {
+    InMemoryMetadataStore store;
+    static_cast<void>(store.create_watch(range_watch(1, "k", "l")));
+    constexpr int writer_count = 32;
+    std::barrier start(writer_count + 1);
+    std::vector<std::future<PutResult>> writers;
+    writers.reserve(writer_count);
+    for (int index = 0; index < writer_count; ++index) {
+        writers.push_back(std::async(
+            std::launch::async,
+            [&store, &start, index] {
+                start.arrive_and_wait();
+                return store.put(
+                    bytes("k" + std::to_string(index)),
+                    bytes("value"));
+            }));
+    }
+    start.arrive_and_wait();
+    for (auto& writer : writers) {
+        static_cast<void>(writer.get());
+    }
+
+    for (std::int64_t revision = 1;
+         revision <= writer_count;
+         ++revision) {
+        const auto response = store.poll_watch(WatchId{1});
+        expect(response.has_value(), "every concurrent mutation is delivered");
+        expect(
+            response->header.revision == revision
+                && response->events.size() == 1
+                && response->events[0].revision.value == revision,
+            "concurrent delivery has no duplicate or reordered revision");
+    }
+    expect(!store.poll_watch(WatchId{1}), "concurrent delivery has no extras");
+}
+
+void failed_mutations_emit_no_watch_events() {
+    InMemoryMetadataStore store;
+    static_cast<void>(store.put(bytes("key"), bytes("value")));
+    static_cast<void>(store.create_watch(range_watch(1, "a", "z")));
+
+    const auto failed_cas =
+        store.compare_and_set(bytes("key"), 0, bytes("wrong"));
+    expect(!failed_cas.succeeded, "test CAS must fail");
+    expect(!store.erase(bytes("absent")).deleted, "test delete must be absent");
+    const auto failed_branch = store.transaction(transaction_request(
+        {Compare{
+            .key = bytes("key"),
+            .target = CompareTarget::value,
+            .result = CompareResult::equal,
+            .expected = bytes("wrong")}},
+        {transaction_put("leak", "value")}));
+    expect(!failed_branch.succeeded, "test comparison must fail");
+    const auto absent_transaction_delete = store.transaction(
+        transaction_request({}, {transaction_delete("x", "y")}));
+    expect(
+        std::get<DeleteRangeResult>(
+            absent_transaction_delete.responses[0]).deleted == 0,
+        "test transaction delete must be absent");
+    expect_throws<std::invalid_argument>(
+        [&store] {
+            static_cast<void>(store.transaction(transaction_request(
+                {},
+                {
+                    transaction_put("duplicate", "one"),
+                    transaction_put("duplicate", "two"),
+                })));
+        },
+        "test transaction must be rejected");
+    expect(
+        !store.poll_watch(WatchId{1}),
+        "failed and no-op mutations emit no watch event");
+}
+
+void leases_grant_keep_alive_and_report_ttl() {
+    using namespace std::chrono_literals;
+    InMemoryMetadataStore store;
+    const auto start = kura::metadata::Clock::TimePoint{};
+    const auto granted = store.grant_lease(
+        LeaseGrantRequest{.ttl = 10s},
+        start);
+
+    expect(granted.lease.id.value == 1, "automatic lease IDs start positive");
+    expect(
+        granted.lease.granted_ttl == 10s
+            && granted.lease.remaining_ttl == 10s,
+        "grant reports its full TTL");
+    expect(
+        store.time_to_live(granted.lease.id, start + 3s)
+                .lease.remaining_ttl
+            == 7s,
+        "TTL lookup reports remaining logical time");
+
+    const auto renewed = store.keep_alive(
+        LeaseKeepAliveRequest{.id = granted.lease.id},
+        start + 5s);
+    expect(
+        renewed.lease.remaining_ttl == 10s
+            && store.time_to_live(granted.lease.id, start + 12s)
+                    .lease.remaining_ttl
+                == 3s,
+        "keepalive resets the deadline from its apply time");
+    expect(store.revision() == 0, "lease timing alone does not change KV revision");
+}
+
+void lease_transactions_attach_reattach_and_fence() {
+    using namespace std::chrono_literals;
+    InMemoryMetadataStore store;
+    const auto now = kura::metadata::Clock::TimePoint{};
+    const LeaseId first = store.grant_lease(
+        LeaseGrantRequest{.requested_id = LeaseId{10}, .ttl = 30s},
+        now).lease.id;
+    const LeaseId second = store.grant_lease(
+        LeaseGrantRequest{.requested_id = LeaseId{20}, .ttl = 30s},
+        now).lease.id;
+
+    const auto attached = store.transaction(transaction_request(
+        {},
+        {transaction_put("owner", "writer-a", false, first.value)}));
+    expect(
+        std::get<PutResult>(attached.responses[0]).current.lease_id
+            == first.value,
+        "transaction put attaches a live lease");
+
+    const auto fenced = store.transaction(transaction_request(
+        {Compare{
+            .key = bytes("owner"),
+            .target = CompareTarget::lease_id,
+            .result = CompareResult::equal,
+            .expected = first.value}},
+        {transaction_put("published", "snapshot")}));
+    expect(fenced.succeeded, "lease comparison fences protected writes");
+
+    const auto reattached = store.transaction(transaction_request(
+        {},
+        {transaction_put("owner", "writer-b", false, second.value)}));
+    expect(
+        std::get<PutResult>(reattached.responses[0]).current.lease_id
+            == second.value,
+        "updating a key can move it to another lease");
+    static_cast<void>(store.revoke_lease(
+        LeaseRevokeRequest{.id = first}));
+    expect(
+        store.get(bytes("owner")).value.has_value(),
+        "revoking the old lease does not delete a reattached key");
+}
+
+void lease_revoke_and_expiry_cascade_atomically() {
+    using namespace std::chrono_literals;
+    InMemoryMetadataStore store;
+    const auto now = kura::metadata::Clock::TimePoint{};
+    const LeaseId first = store.grant_lease(
+        LeaseGrantRequest{.ttl = 5s},
+        now).lease.id;
+    const LeaseId second = store.grant_lease(
+        LeaseGrantRequest{.ttl = 5s},
+        now).lease.id;
+    static_cast<void>(store.transaction(transaction_request(
+        {},
+        {
+            transaction_put("a", "1", false, first.value),
+            transaction_put("b", "2", false, first.value),
+            transaction_put("c", "3", false, second.value),
+        })));
+    static_cast<void>(store.create_watch(range_watch(1, "a", "z")));
+
+    const auto revoked = store.revoke_lease(
+        LeaseRevokeRequest{.id = first});
+    expect(
+        revoked.header.revision == 2
+            && !store.get(bytes("a")).value
+            && !store.get(bytes("b")).value
+            && store.get(bytes("c")).value.has_value(),
+        "revoke removes all and only attached keys in one revision");
+    const auto revoke_events = store.poll_watch(WatchId{1});
+    expect(
+        revoke_events && revoke_events->events.size() == 2
+            && revoke_events->events[0].revision.value == 2
+            && revoke_events->events[1].revision.value == 2,
+        "revoke publishes one atomic ordered watch batch");
+
+    expect(store.expire_leases(now + 4s) == 0, "lease is live before deadline");
+    expect(store.expire_leases(now + 5s) == 1, "deadline expires the lease");
+    expect(
+        !store.get(bytes("c")).value && store.revision() == 3,
+        "expiry cascade uses one mutation revision");
+    expect_throws<StoreError>(
+        [&store, second, now] {
+            static_cast<void>(store.keep_alive(
+                LeaseKeepAliveRequest{.id = second},
+                now));
+        },
+        "expired leases cannot be renewed after expiry is applied");
+}
+
+void lease_validation_and_limits_are_explicit() {
+    using namespace std::chrono_literals;
+    StoreLimits limits;
+    limits.max_active_leases = 1;
+    InMemoryMetadataStore store(limits);
+    const auto now = kura::metadata::Clock::TimePoint{};
+    static_cast<void>(store.grant_lease(
+        LeaseGrantRequest{.requested_id = LeaseId{7}, .ttl = 1s},
+        now));
+
+    expect_throws<StoreError>(
+        [&store, now] {
+            static_cast<void>(store.grant_lease(
+                LeaseGrantRequest{.ttl = 1s},
+                now));
+        },
+        "active lease limit must reject grants");
+    expect_throws<StoreError>(
+        [&store] {
+            static_cast<void>(store.transaction(transaction_request(
+                {},
+                {transaction_put("key", "value", false, 99)})));
+        },
+        "transaction cannot attach an unknown lease");
+    expect(!store.get(bytes("key")).value, "failed attachment is atomic");
 }
 
 }  // namespace
