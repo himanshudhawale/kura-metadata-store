@@ -1,7 +1,10 @@
 .idea/
 .vscode/
-*.iml
-target/
+build/
 out/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+compile_commands.json
 *.log
 *.tmp
