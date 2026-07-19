@@ -112,19 +112,28 @@ When metadata quorum is unavailable:
 
 This favors metadata correctness over write availability during partitions.
 
-## 8. Required helper client
+## 8. Helper client
 
-A future C++ client library hides unsafe composition:
+The C++23 helper client hides unsafe composition:
 
 ```text
 acquireWriter(tableId, ttl) -> WriterGuard
 publishSnapshot(guard, expectedRevision, pointer) -> PublishResult
 registerReader(tableId, snapshot, ttl) -> ReaderGuard
-awaitSnapshotChange(tableId, fromRevision) -> SnapshotPointer
+awaitSnapshotChange(tableId, fromRevision) -> SnapshotUpdate
 ```
 
 Guards own keepalive and cleanup behavior. Publishing always includes the
 server-side lease/fencing comparison.
+
+The implemented backend is an in-process adapter. Its atomic collection check
+is exact only when related operations use the same adapter. Compaction performs
+a full current read and marks the result as a resynchronization. The
+post-commit leader-response test uses a fault-injection seam; it does not claim
+networking, Raft, or distributed failover behavior.
+
+Full design and alternatives are in
+[Design 0010: Kura Metadata Helper Client](design/0010-kura-metadata-helper-client.md).
 
 ## 9. Compatibility acceptance tests
 

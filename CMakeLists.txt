@@ -27,6 +27,7 @@ add_library(
     src/figure2_spec.cpp
     src/raft_election.cpp
     src/raft_hard_state_store.cpp
+    src/kura_client.cpp
     src/key_range.cpp
     src/in_memory_metadata_store.cpp
     src/raft_simulation.cpp)
@@ -152,4 +153,18 @@ if(BUILD_TESTING)
     add_test(
         NAME kura_raft_election_tests
         COMMAND kura_raft_election_tests)
+
+    add_executable(
+        kura_client_tests
+        tests/kura_client_test.cpp)
+
+    target_link_libraries(kura_client_tests PRIVATE kura_metadata)
+
+    if(MSVC)
+        target_compile_options(kura_client_tests PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(kura_client_tests PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+
+    add_test(NAME kura_client_tests COMMAND kura_client_tests)
 endif()

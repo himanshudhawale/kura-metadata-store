@@ -26,6 +26,9 @@ Implemented now:
   events and deterministic write-boundary fault injection
 - Deterministic follower/candidate election core with seeded logical
   deadlines, RequestVote, persistence-gated sends, and simulator adapter
+- C++23 Kura helper with RAII writer/reader leases, fenced publication,
+  reader-protected metadata collection, and watch compaction resynchronization
+- In-process backend adapter and deterministic uncertain-response fault seam
 
 Declared but not implemented:
 
@@ -35,7 +38,7 @@ Declared but not implemented:
 - AppendEntries, replicated commit/apply, production Raft transport,
   membership, snapshots, and ReadIndex
 - Network server, authentication, and metrics
-- Remote client and Kura helper
+- Remote client transport and real leader-failover integration
 
 Scaffolding must not be used as evidence of availability, durability,
 linearizability across nodes, or production readiness.

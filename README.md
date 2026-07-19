@@ -19,7 +19,9 @@ WAL, networking, and state-machine execution.
 > boundaries exist but are not connected to mutation responses. A deterministic
 > logical-time Raft simulator, executable Figure 2 specification, and an
 > internal RequestVote-only election core exist, but replication and the
-> production Raft service do not. The service is not distributed,
+> production Raft service do not. An in-process Kura helper safely composes
+> snapshot transactions, leases, and watches without claiming a remote or
+> distributed client. The service is not distributed,
 > replicated, durably integrated, or highly available. Do not use it for
 > production metadata.
 
@@ -95,9 +97,11 @@ then set current snapshot pointer = new immutable manifest
 else report a conflict
 ```
 
-Later, lease-backed reader registrations prevent Kura from garbage-collecting a
-snapshot while a query still reads it. Watches notify compute nodes when a new
-snapshot becomes current. See [Kura integration](docs/kura-integration.md).
+The in-process C++23 helper now provides fenced writer publication,
+lease-backed reader registrations, reader-protected metadata collection, and
+compaction-aware watch resynchronization. Move-only guards own automatic
+keepalive and cleanup. A remote transport and real leader-failover integration
+still depend on later phases. See [Kura integration](docs/kura-integration.md).
 
 Lease time is currently supplied as logical ticks by the caller. The core does
 not read a wall clock, and no background expiry driver is implemented.
@@ -119,6 +123,7 @@ not read a wall clock, and no background expiry driver is implemented.
 - [Executable Raft Figure 2 design](docs/design/0007-executable-raft-figure-2.md)
 - [Raft hard-state persistence design](docs/design/0008-raft-hard-state-persistence.md)
 - [Deterministic Raft election design](docs/design/0009-raft-election-core.md)
+- [Kura metadata helper design](docs/design/0010-kura-metadata-helper-client.md)
 - [WAL format v1](docs/formats/wal-v1.md)
 - [Snapshot format v1](docs/formats/snapshot-v1.md)
 - [Raft hard-state format v1](docs/formats/raft-hard-state-v1.md)
