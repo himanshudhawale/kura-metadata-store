@@ -62,10 +62,12 @@ an entry only after the commit index includes that entry.
 
 ### Persistence
 
-The Raft write-ahead log persists terms, votes, and entries before successful
-peer acknowledgement. State-machine snapshots bound recovery time. A crash must
-leave either the old complete snapshot or the new complete snapshot, never a
-partially published one.
+The atomic Raft hard-state record persists `currentTerm` and `votedFor`; the
+write-ahead log persists entries. The Raft core receives an explicit durable
+completion event before it may emit a granted vote or a higher-term success
+response. State-machine snapshots bound recovery time. A crash must leave
+either the old complete hard state/snapshot or the new complete one, never a
+partially accepted publication.
 
 ## 4. Revision model
 

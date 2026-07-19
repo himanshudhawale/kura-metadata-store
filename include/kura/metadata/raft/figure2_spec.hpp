@@ -2,6 +2,7 @@
 
 #include "kura/metadata/core/command.hpp"
 #include "kura/metadata/raft/append_entries.hpp"
+#include "kura/metadata/raft/persistence.hpp"
 #include "kura/metadata/raft/persistent_state.hpp"
 #include "kura/metadata/raft/request_vote.hpp"
 #include "kura/metadata/raft/role.hpp"
@@ -74,17 +75,6 @@ struct LeaderState {
     std::set<LogIndex> pending_clients;
 };
 
-struct State {
-    NodeId node;
-    std::vector<NodeId> peers;
-    RaftRole role{RaftRole::follower};
-    PersistentRaftState persistent;
-    VolatileState volatile_state;
-    std::optional<NodeId> known_leader;
-    std::set<NodeId> votes_received;
-    std::optional<LeaderState> leader;
-};
-
 struct ElectionTimeout {};
 struct HeartbeatTimeout {};
 struct ApplyCommitted {};
@@ -121,11 +111,10 @@ using Event = std::variant<
     ReceiveRequestVoteResponse,
     ReceiveAppendEntries,
     ReceiveAppendEntriesResponse,
-    ReceiveClientCommand>;
+    ReceiveClientCommand,
+    RaftHardStatePersisted>;
 
 enum class PersistentField {
-    current_term,
-    voted_for,
     log
 };
 
@@ -165,6 +154,7 @@ struct CompleteClientCommand {
 };
 
 using Effect = std::variant<
+    PersistRaftHardState,
     PersistState,
     SendRequestVote,
     SendRequestVoteResponse,
@@ -173,6 +163,24 @@ using Effect = std::variant<
     ResetElectionTimer,
     ApplyCommand,
     CompleteClientCommand>;
+
+struct PendingHardStatePersistence {
+    PersistRaftHardState request;
+    std::vector<Effect> deferred_effects;
+};
+
+struct State {
+    NodeId node;
+    std::vector<NodeId> peers;
+    RaftRole role{RaftRole::follower};
+    PersistentRaftState persistent;
+    VolatileState volatile_state;
+    std::optional<NodeId> known_leader;
+    std::set<NodeId> votes_received;
+    std::optional<LeaderState> leader;
+    std::uint64_t next_hard_state_request_id{1};
+    std::optional<PendingHardStatePersistence> pending_hard_state;
+};
 
 struct StepResult {
     State state;

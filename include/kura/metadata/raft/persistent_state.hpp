@@ -9,6 +9,13 @@
 
 namespace kura::metadata {
 
+struct RaftHardState {
+    Term current_term;
+    std::optional<NodeId> voted_for;
+
+    bool operator==(const RaftHardState&) const = default;
+};
+
 struct PersistentRaftState {
     Term current_term;
     std::optional<NodeId> voted_for;
