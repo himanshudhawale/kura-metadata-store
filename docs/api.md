@@ -152,8 +152,8 @@ Selected operations execute in order. A range sees writes from earlier
 operations in its branch. Results preserve request order and are typed as
 `RangeRead`, `PutResult`, or `DeleteRangeResult`. A zero range limit means
 unlimited. Historical range revisions are rejected because historical MVCC is not
-implemented. A put may carry zero for no lease or the ID of an active lease;
-an unknown lease rejects the complete selected branch.
+implemented. A nonzero put lease ID requires a matching live lease ownership
+comparison in the same transaction.
 
 If at least one put or effective delete occurs, the store revision advances
 exactly once and every mutation uses it. Read-only branches and branches whose
@@ -162,7 +162,7 @@ counter overflow fail atomically without changing state.
 
 The exclusive in-memory transaction boundary makes concurrent comparisons,
 branch execution, and publication atomic within one process. It does not claim
-cross-node linearizability, durability, watch delivery, or lease behavior.
+cross-node linearizability or durability.
 
 Design and edge cases are documented in
 [Design 0002: In-memory If/Then/Else Transactions](design/0002-if-then-else-transactions.md).
@@ -218,33 +218,51 @@ Design rationale and edge cases are documented in
 
 ## 6. Lease
 
-A lease is a future replicated TTL record. The current in-memory store
-implements:
+A lease is currently an in-memory deterministic TTL record. It is not yet
+replicated or durable. The implemented operations are:
 
 ```text
-grant_lease(request, now)
-keep_alive(request, now)
-time_to_live(leaseId, now)
-revoke_lease(request)
-expire_leases(now)
+grantLease(requestedId, ttl, tick)
+keepAlive(leaseId, fencingToken, tick)
+timeToLive(leaseId, tick)
+revokeLease(leaseId, fencingToken, tick)
+expireLeases(tick)
 ```
 
-Time is explicit state-machine input; followers must never independently infer
-expiry from their wall clocks. One expiry apply removes every due lease and
-deletes all attached keys in one revision and atomic watch batch. Revoke has
-the same cascade semantics for one lease. Grant and keepalive do not advance
-the key-value revision when no key changes.
+Time is a caller-supplied unsigned logical tick; deterministic core logic never
+reads a wall clock. TTL is positive ticks, expiry occurs at the deadline, and
+applied command ticks cannot move backwards. Zero lease ID means unattached.
+Safe allocated IDs are positive signed 64-bit values below `INT64_MAX`.
 
-Transaction puts attach or reattach keys to active leases. A
-`CompareTarget::lease_id` check can verify that an ownership key still carries
-the expected lease in the same transaction as a protected write.
+Each grant receives a globally increasing `FencingToken`. Lifecycle lookup
+distinguishes `ok`, `not_found`, `expired`, and `fencing_token_mismatch`.
+Keepalive resets the original TTL only for the current live generation.
 
-A client believing it holds a lease is not sufficient for mutual exclusion.
-Protected writes must execute a server-side transaction that verifies the
-lease attachment and fencing modification revision.
+`expireLeases` processes every due lease in lease-ID order. Revoke and expiry
+remove all attached keys in unsigned key order and publish one atomic revision
+and watch batch per nonempty lease batch. Reattaching a key removes it from the
+old lease before adding it to the new lease, so old-lease expiry cannot delete
+it.
 
-Design rationale and edge cases are documented in
-[Design 0004: Lease lifecycle and fenced ownership](design/0004-lease-lifecycle-and-fenced-ownership.md).
+`TransactionRequest::lease_ownership` contains `(lease ID, fencing token)`
+comparisons evaluated at `lease_tick` with ordinary key comparisons. A stale or
+expired generation selects the failure branch. Any selected put with a nonzero
+lease ID requires verified ownership for that lease.
+
+A client believing it holds a lease is not sufficient for mutual exclusion: a
+paused client can resume after expiry and replacement. Protected writes must
+verify the live generation in the same server-side transaction, and external
+resources must likewise honor the fencing token.
+
+`InMemoryStoreSnapshot` includes lease records, ordered attachments, logical
+tick, and allocation counters for later serialization and replicated command
+application. Restoration validates allocation counters, lease limits, key
+metadata, duplicates, and both directions of the attachment index. It is an
+in-memory representation suitable for an opaque durable snapshot body, not the
+durable serialization itself.
+
+Full rationale and edge cases are documented in
+[Design 0004: Lease Lifecycle and Fenced Ownership](design/0004-lease-lifecycle-and-fencing.md).
 
 ## 7. Request idempotency
 

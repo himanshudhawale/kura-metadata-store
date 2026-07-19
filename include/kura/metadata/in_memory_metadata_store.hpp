@@ -1,11 +1,10 @@
 #pragma once
 
-#include "kura/metadata/core/limits.hpp"
 #include "kura/metadata/core/clock.hpp"
+#include "kura/metadata/core/limits.hpp"
 #include "kura/metadata/kv/transaction_request.hpp"
 #include "kura/metadata/kv/transaction_result.hpp"
-#include "kura/metadata/lease/lease_request.hpp"
-#include "kura/metadata/lease/lease_response.hpp"
+#include "kura/metadata/lease/lease_snapshot.hpp"
 #include "kura/metadata/metadata_store.hpp"
 #include "kura/metadata/watch/watch_request.hpp"
 #include "kura/metadata/watch/watch_response.hpp"
@@ -14,6 +13,7 @@
 #include <chrono>
 #include <deque>
 #include <map>
+#include <set>
 #include <shared_mutex>
 #include <vector>
 
@@ -30,6 +30,10 @@ public:
     InMemoryMetadataStore(
         std::vector<KeyValue> initial_values,
         std::int64_t initial_revision,
+        StoreLimits limits = {});
+
+    explicit InMemoryMetadataStore(
+        InMemoryStoreSnapshot snapshot,
         StoreLimits limits = {});
 
     [[nodiscard]] StoreRead get(const ByteSequence& key) const override;
@@ -52,22 +56,22 @@ public:
     [[nodiscard]] TransactionResult transaction(
         const TransactionRequest& request) override;
 
-    [[nodiscard]] LeaseResponse grant_lease(
-        const LeaseGrantRequest& request,
-        Clock::TimePoint now);
+    [[nodiscard]] LeaseGrantResult grant_lease(
+        const LeaseGrantRequest& request) override;
 
-    [[nodiscard]] LeaseResponse keep_alive(
-        const LeaseKeepAliveRequest& request,
-        Clock::TimePoint now);
+    [[nodiscard]] LeaseLookupResult keep_alive(
+        const LeaseKeepAliveRequest& request) override;
 
-    [[nodiscard]] LeaseResponse time_to_live(
-        LeaseId id,
-        Clock::TimePoint now) const;
+    [[nodiscard]] LeaseLookupResult time_to_live(
+        const LeaseTimeToLiveRequest& request) const override;
 
-    [[nodiscard]] LeaseResponse revoke_lease(
-        const LeaseRevokeRequest& request);
+    [[nodiscard]] LeaseCleanupResult revoke_lease(
+        const LeaseRevokeRequest& request) override;
 
-    [[nodiscard]] std::size_t expire_leases(Clock::TimePoint now);
+    [[nodiscard]] LeaseCleanupResult expire_leases(
+        LeaseTick tick) override;
+
+    [[nodiscard]] InMemoryStoreSnapshot snapshot() const;
 
     [[nodiscard]] WatchResponse create_watch(const WatchRequest& request);
 
@@ -99,10 +103,11 @@ private:
         std::int64_t compact_revision;
     };
 
-    struct LeaseState {
-        LeaseId id;
-        std::chrono::seconds granted_ttl;
-        Clock::TimePoint deadline;
+    struct StoredLease {
+        FencingToken fencing_token;
+        LeaseDuration granted_ttl;
+        LeaseTick expiry_tick;
+        std::set<ByteSequence> attached_keys;
     };
 
     [[nodiscard]] PutResult put_locked(
@@ -120,20 +125,31 @@ private:
         const WatchRequest& request,
         const WatchEvent& event);
 
-    [[nodiscard]] LeaseResponse remove_leases_locked(
+    [[nodiscard]] LeaseRecord lease_record_locked(
+        LeaseId id,
+        const StoredLease& lease) const;
+
+    [[nodiscard]] LeaseLookupResult lookup_lease_locked(
+        LeaseId id,
+        LeaseTick tick) const;
+
+    [[nodiscard]] LeaseCleanupResult remove_leases_locked(
         const std::vector<LeaseId>& ids,
-        LeaseId response_id,
-        std::chrono::seconds granted_ttl);
+        LeaseResultCode code);
 
-    [[nodiscard]] LeaseId next_lease_id_locked();
-
-    [[nodiscard]] static std::chrono::seconds remaining_ttl(
-        const LeaseState& lease,
-        Clock::TimePoint now);
+    void detach_key_locked(const KeyValue& value);
+    static void detach_key(
+        std::map<LeaseId, StoredLease>& leases,
+        const KeyValue& value);
+    static void attach_key(
+        std::map<LeaseId, StoredLease>& leases,
+        LeaseId id,
+        const ByteSequence& key);
 
     [[nodiscard]] std::int64_t next_revision_locked() const;
 
     static void validate_key(const ByteSequence& key);
+    void validate_tick_locked(LeaseTick tick) const;
 
     mutable std::shared_mutex mutex_;
     std::map<ByteSequence, KeyValue> values_;
@@ -142,8 +158,10 @@ private:
     std::int64_t compact_revision_;
     std::deque<EventBatch> history_;
     std::map<WatchId, WatchState> watchers_;
-    std::map<LeaseId, LeaseState> leases_;
+    std::map<LeaseId, StoredLease> leases_;
+    LeaseTick logical_tick_;
     std::int64_t next_lease_id_{1};
+    FencingToken next_fencing_token_{1};
 };
 
 }  // namespace kura::metadata

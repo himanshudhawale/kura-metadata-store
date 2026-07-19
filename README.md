@@ -39,13 +39,16 @@ put(key, value)
 delete(key)
 transaction(if comparisons, then operations, else operations)
 watch(prefix, fromRevision)
-grantLease(ttl)
-keepAlive(lease)
-revokeLease(lease)
+grantLease(requestedId, ttl, tick)
+keepAlive(lease, fencingToken, tick)
+timeToLive(lease, tick)
+revokeLease(lease, fencingToken, tick)
+expireLeases(tick)
 ```
 
-The initial code implements versioned `get`, `range`, `put`, `delete`, and one
-compare-and-set operation. It establishes semantics for later persistence and
+The initial code implements versioned key operations, atomic If/Then/Else
+transactions, and deterministic lease lifecycle with fenced ownership and
+atomic attached-key cleanup. It establishes semantics for later persistence and
 replication; it does not pretend those guarantees already exist.
 
 ## Architecture
@@ -88,6 +91,9 @@ else report a conflict
 Later, lease-backed reader registrations prevent Kura from garbage-collecting a
 snapshot while a query still reads it. Watches notify compute nodes when a new
 snapshot becomes current. See [Kura integration](docs/kura-integration.md).
+
+Lease time is currently supplied as logical ticks by the caller. The core does
+not read a wall clock, and no background expiry driver is implemented.
 
 ## Documentation
 

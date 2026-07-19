@@ -3,23 +3,31 @@
 #include "kura/metadata/core/request_id.hpp"
 #include "kura/metadata/lease/lease_id.hpp"
 
-#include <chrono>
-
 namespace kura::metadata {
 
 struct LeaseGrantRequest {
     RequestId request_id;
     LeaseId requested_id;
-    std::chrono::seconds ttl;
+    LeaseDuration ttl;
+    LeaseTick tick;
 };
 
 struct LeaseKeepAliveRequest {
     LeaseId id;
+    FencingToken fencing_token;
+    LeaseTick tick;
+};
+
+struct LeaseTimeToLiveRequest {
+    LeaseId id;
+    LeaseTick tick;
 };
 
 struct LeaseRevokeRequest {
     RequestId request_id;
     LeaseId id;
+    FencingToken fencing_token;
+    LeaseTick tick;
 };
 
 }  // namespace kura::metadata

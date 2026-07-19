@@ -37,7 +37,8 @@ storage. It then submits one metadata transaction:
 ```text
 IF
   modRevision(currentKey) == expectedRevision
-  AND writerKey is attached to my live lease
+  AND leaseOwnership(writerLeaseId, writerFencingToken) is live
+  AND leaseId(writerKey) == writerLeaseId
 THEN
   put(currentKey, newSnapshotPointer)
   put(snapshotMetadataKey, newSnapshotMetadata)
@@ -54,12 +55,16 @@ current state and either rebases or reports a conflict.
 ## 4. Fenced writer ownership
 
 A lease alone cannot protect publication because a paused writer may resume
-after its lease expires. Every publication verifies ownership inside the same
-transaction. The winning lock generation or modification revision acts as a
-fencing token.
+after its lease expires. Every publication verifies its lease ID and current
+`FencingToken` inside the same transaction. Each new lease generation receives
+a greater token, including explicit ID reuse.
 
 Kura must reject stale writers even if they still hold local credentials or
 remember an old lease.
+
+The current implementation supplies this check only in one process using
+caller-supplied logical ticks. It does not yet provide replicated or durable
+ownership.
 
 ## 5. Reader protection
 
