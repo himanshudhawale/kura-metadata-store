@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <limits>
 #include <mutex>
+#include <ranges>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
@@ -26,6 +27,9 @@ bool contains_key(const KeyRange& range, const ByteSequence& key) {
 bool ranges_overlap(const KeyRange& left, const KeyRange& right) {
     return left.start < right.end && right.start < left.end;
 }
+
+constexpr std::int64_t maximum_lease_id =
+    std::numeric_limits<std::int64_t>::max() - 1;
 
 template <typename Value>
 bool comparison_matches(
@@ -74,6 +78,76 @@ InMemoryMetadataStore::InMemoryMetadataStore(
         static_cast<void>(iterator);
         if (!inserted) {
             throw std::invalid_argument("duplicate initial key");
+        }
+    }
+}
+
+InMemoryMetadataStore::InMemoryMetadataStore(
+    InMemoryStoreSnapshot snapshot)
+    : revision_(snapshot.revision),
+      logical_tick_(snapshot.logical_tick),
+      next_lease_id_(snapshot.next_lease_id),
+      next_fencing_token_(snapshot.next_fencing_token) {
+    if (revision_ < 0 || next_lease_id_ <= 0
+        || next_fencing_token_.value == 0) {
+        throw std::invalid_argument("invalid snapshot counters");
+    }
+
+    for (const LeaseRecord& lease : snapshot.leases) {
+        if (lease.id.value <= 0 || lease.id.value > maximum_lease_id
+            || lease.fencing_token.value == 0
+            || lease.granted_ttl.ticks == 0) {
+            throw std::invalid_argument("invalid snapshot lease");
+        }
+        StoredLease stored{
+            .fencing_token = lease.fencing_token,
+            .granted_ttl = lease.granted_ttl,
+            .expiry_tick = lease.expiry_tick};
+        for (const ByteSequence& key : lease.attached_keys) {
+            validate_key(key);
+            if (!stored.attached_keys.insert(key).second) {
+                throw std::invalid_argument(
+                    "duplicate snapshot lease attachment");
+            }
+        }
+        if (!leases_.emplace(lease.id, std::move(stored)).second) {
+            throw std::invalid_argument("duplicate snapshot lease");
+        }
+    }
+
+    for (auto& value : snapshot.values) {
+        validate_key(value.key);
+        if (value.version <= 0 || value.create_revision <= 0
+            || value.mod_revision < value.create_revision
+            || value.mod_revision > revision_ || value.lease_id < 0) {
+            throw std::invalid_argument("invalid snapshot key metadata");
+        }
+        if (!values_.emplace(value.key, value).second) {
+            throw std::invalid_argument("duplicate snapshot key");
+        }
+        if (value.lease_id != 0) {
+            const auto lease = leases_.find(LeaseId{value.lease_id});
+            if (lease == leases_.end()
+                || !lease->second.attached_keys.contains(value.key)) {
+                throw std::invalid_argument(
+                    "snapshot key attachment is inconsistent");
+            }
+        }
+    }
+
+    for (const auto& [id, lease] : leases_) {
+        if (id.value >= next_lease_id_
+            || lease.fencing_token.value
+                >= next_fencing_token_.value) {
+            throw std::invalid_argument(
+                "snapshot allocation counters are not ahead of leases");
+        }
+        for (const ByteSequence& key : lease.attached_keys) {
+            const auto value = values_.find(key);
+            if (value == values_.end() || value->second.lease_id != id.value) {
+                throw std::invalid_argument(
+                    "snapshot lease attachment is inconsistent");
+            }
         }
     }
 }
@@ -129,6 +203,7 @@ DeleteResult InMemoryMetadataStore::erase(const ByteSequence& key) {
 
     const std::int64_t mutation_revision = next_revision_locked();
     KeyValue previous = iterator->second;
+    detach_key_locked(previous);
     values_.erase(iterator);
     revision_ = mutation_revision;
     return {
@@ -223,6 +298,26 @@ TransactionResult InMemoryMetadataStore::transaction(
         comparisons_succeeded = comparisons_succeeded && matches;
     }
 
+    std::vector<LeaseOwnership> verified_ownership;
+    verified_ownership.reserve(request.lease_ownership.size());
+    if (!request.lease_ownership.empty()) {
+        validate_tick_locked(request.lease_tick);
+    }
+    for (const LeaseOwnership& ownership : request.lease_ownership) {
+        if (ownership.id.value <= 0 || ownership.fencing_token.value == 0) {
+            throw std::invalid_argument("invalid lease ownership comparison");
+        }
+        const auto lease = leases_.find(ownership.id);
+        const bool matches =
+            lease != leases_.end()
+            && request.lease_tick < lease->second.expiry_tick
+            && lease->second.fencing_token == ownership.fencing_token;
+        comparisons_succeeded = comparisons_succeeded && matches;
+        if (matches) {
+            verified_ownership.push_back(ownership);
+        }
+    }
+
     const std::vector<RequestOperation>& operations =
         comparisons_succeeded ? request.success : request.failure;
     std::vector<ByteSequence> put_keys;
@@ -232,6 +327,7 @@ TransactionResult InMemoryMetadataStore::transaction(
     for (const RequestOperation& operation : operations) {
         std::visit(
             [this,
+             &verified_ownership,
              &put_keys,
              &delete_ranges,
              &has_effective_mutation](const auto& typed_operation) {
@@ -244,9 +340,20 @@ TransactionResult InMemoryMetadataStore::transaction(
                     }
                 } else if constexpr (std::is_same_v<Operation, PutRequest>) {
                     validate_key(typed_operation.key);
-                    if (typed_operation.lease_id != 0) {
+                    if (typed_operation.lease_id < 0) {
                         throw std::invalid_argument(
-                            "nonzero lease IDs are not implemented");
+                            "lease ID must not be negative");
+                    }
+                    if (typed_operation.lease_id != 0
+                        && std::ranges::none_of(
+                            verified_ownership,
+                            [&typed_operation](
+                                const LeaseOwnership& ownership) {
+                                return ownership.id.value
+                                    == typed_operation.lease_id;
+                            })) {
+                        throw std::invalid_argument(
+                            "leased put requires verified ownership");
                     }
                     if (std::ranges::find(put_keys, typed_operation.key)
                         != put_keys.end()) {
@@ -309,12 +416,16 @@ TransactionResult InMemoryMetadataStore::transaction(
     const std::int64_t transaction_revision =
         has_effective_mutation ? next_revision_locked() : revision_;
     std::map<ByteSequence, KeyValue> working = values_;
+    std::map<LeaseId, StoredLease> working_leases = leases_;
     std::vector<TransactionOperationResult> responses;
     responses.reserve(operations.size());
 
     for (const RequestOperation& operation : operations) {
         std::visit(
-            [&working, &responses, transaction_revision](
+            [&working,
+             &working_leases,
+             &responses,
+             transaction_revision](
                 const auto& typed_operation) {
                 using Operation = std::decay_t<decltype(typed_operation)>;
                 if constexpr (std::is_same_v<Operation, RangeRequest>) {
@@ -338,6 +449,7 @@ TransactionResult InMemoryMetadataStore::transaction(
                     std::optional<KeyValue> previous;
                     if (existing != working.end()) {
                         previous = existing->second;
+                        detach_key(working_leases, *previous);
                     }
                     const std::int64_t version =
                         previous.has_value() ? previous->version + 1 : 1;
@@ -349,7 +461,13 @@ TransactionResult InMemoryMetadataStore::transaction(
                             ? previous->create_revision
                             : transaction_revision,
                         .mod_revision = transaction_revision,
-                        .lease_id = 0};
+                        .lease_id = typed_operation.lease_id};
+                    if (typed_operation.lease_id != 0) {
+                        attach_key(
+                            working_leases,
+                            LeaseId{typed_operation.lease_id},
+                            typed_operation.key);
+                    }
                     const auto [stored, inserted] =
                         working.insert_or_assign(
                             typed_operation.key,
@@ -368,6 +486,7 @@ TransactionResult InMemoryMetadataStore::transaction(
                         working.lower_bound(typed_operation.range.start);
                     while (iterator != working.end()
                            && iterator->first < typed_operation.range.end) {
+                        detach_key(working_leases, iterator->second);
                         if (typed_operation.return_previous) {
                             previous.push_back(iterator->second);
                         }
@@ -384,11 +503,162 @@ TransactionResult InMemoryMetadataStore::transaction(
     }
 
     values_.swap(working);
+    leases_.swap(working_leases);
     revision_ = transaction_revision;
+    if (!request.lease_ownership.empty()) {
+        logical_tick_ = request.lease_tick;
+    }
     return {
         .header = ResponseHeader{.revision = transaction_revision},
         .succeeded = comparisons_succeeded,
         .responses = std::move(responses)};
+}
+
+LeaseGrantResult InMemoryMetadataStore::grant_lease(
+    const LeaseGrantRequest& request) {
+    const std::unique_lock lock(mutex_);
+    validate_tick_locked(request.tick);
+    if (request.ttl.ticks == 0) {
+        throw std::invalid_argument("lease TTL must be positive");
+    }
+    if (request.tick.value
+        > std::numeric_limits<std::uint64_t>::max() - request.ttl.ticks) {
+        throw std::overflow_error("lease expiry tick exhausted");
+    }
+    if (next_fencing_token_.value
+        == std::numeric_limits<std::uint64_t>::max()) {
+        throw std::overflow_error("fencing token exhausted");
+    }
+
+    LeaseId id = request.requested_id;
+    if (id.value == 0) {
+        if (next_lease_id_ > maximum_lease_id) {
+            throw std::overflow_error("lease ID exhausted");
+        }
+        id.value = next_lease_id_;
+    } else if (id.value < 0 || id.value > maximum_lease_id) {
+        throw std::invalid_argument("requested lease ID is outside safe range");
+    }
+    if (leases_.contains(id)) {
+        throw std::invalid_argument("requested lease ID is already live");
+    }
+
+    StoredLease stored{
+        .fencing_token = next_fencing_token_,
+        .granted_ttl = request.ttl,
+        .expiry_tick =
+            LeaseTick{request.tick.value + request.ttl.ticks}};
+    const auto [lease, inserted] = leases_.emplace(id, std::move(stored));
+    static_cast<void>(inserted);
+    if (id.value >= next_lease_id_) {
+        next_lease_id_ = id.value + 1;
+    }
+    ++next_fencing_token_.value;
+    logical_tick_ = request.tick;
+    return {
+        .lease = lease_record_locked(id, lease->second),
+        .revision = revision_};
+}
+
+LeaseLookupResult InMemoryMetadataStore::keep_alive(
+    const LeaseKeepAliveRequest& request) {
+    const std::unique_lock lock(mutex_);
+    validate_tick_locked(request.tick);
+    if (request.id.value <= 0 || request.fencing_token.value == 0) {
+        throw std::invalid_argument("invalid keepalive ownership");
+    }
+
+    LeaseLookupResult result = lookup_lease_locked(request.id, request.tick);
+    if (result.code == LeaseResultCode::ok) {
+        auto& lease = leases_.find(request.id)->second;
+        if (lease.fencing_token != request.fencing_token) {
+            result.code = LeaseResultCode::fencing_token_mismatch;
+        } else {
+            if (request.tick.value
+                > std::numeric_limits<std::uint64_t>::max()
+                    - lease.granted_ttl.ticks) {
+                throw std::overflow_error("lease expiry tick exhausted");
+            }
+            lease.expiry_tick =
+                LeaseTick{request.tick.value + lease.granted_ttl.ticks};
+            result.lease->expiry_tick = lease.expiry_tick;
+            result.remaining_ttl = lease.granted_ttl;
+        }
+    }
+    logical_tick_ = request.tick;
+    return result;
+}
+
+LeaseLookupResult InMemoryMetadataStore::time_to_live(
+    const LeaseTimeToLiveRequest& request) const {
+    const std::shared_lock lock(mutex_);
+    validate_tick_locked(request.tick);
+    if (request.id.value <= 0) {
+        throw std::invalid_argument("invalid lease ID");
+    }
+    return lookup_lease_locked(request.id, request.tick);
+}
+
+LeaseCleanupResult InMemoryMetadataStore::revoke_lease(
+    const LeaseRevokeRequest& request) {
+    const std::unique_lock lock(mutex_);
+    validate_tick_locked(request.tick);
+    if (request.id.value <= 0 || request.fencing_token.value == 0) {
+        throw std::invalid_argument("invalid revoke ownership");
+    }
+    const auto lease = leases_.find(request.id);
+    if (lease == leases_.end()) {
+        logical_tick_ = request.tick;
+        return {
+            .code = LeaseResultCode::not_found,
+            .revision = revision_};
+    }
+    if (lease->second.fencing_token != request.fencing_token) {
+        logical_tick_ = request.tick;
+        return {
+            .code = LeaseResultCode::fencing_token_mismatch,
+            .revision = revision_};
+    }
+
+    LeaseCleanupResult result =
+        remove_leases_locked({request.id}, LeaseResultCode::ok);
+    logical_tick_ = request.tick;
+    return result;
+}
+
+LeaseCleanupResult InMemoryMetadataStore::expire_leases(
+    const LeaseTick tick) {
+    const std::unique_lock lock(mutex_);
+    validate_tick_locked(tick);
+    std::vector<LeaseId> expired;
+    for (const auto& [id, lease] : leases_) {
+        if (lease.expiry_tick <= tick) {
+            expired.push_back(id);
+        }
+    }
+    LeaseCleanupResult result =
+        remove_leases_locked(expired, LeaseResultCode::ok);
+    logical_tick_ = tick;
+    return result;
+}
+
+InMemoryStoreSnapshot InMemoryMetadataStore::snapshot() const {
+    const std::shared_lock lock(mutex_);
+    InMemoryStoreSnapshot result{
+        .revision = revision_,
+        .logical_tick = logical_tick_,
+        .next_lease_id = next_lease_id_,
+        .next_fencing_token = next_fencing_token_};
+    result.values.reserve(values_.size());
+    for (const auto& [key, value] : values_) {
+        static_cast<void>(key);
+        result.values.push_back(value);
+    }
+    result.leases.reserve(leases_.size());
+    for (const auto& [id, lease] : leases_) {
+        result.leases.push_back(lease_record_locked(id, lease));
+    }
+    return result;
 }
 
 std::int64_t InMemoryMetadataStore::revision() const {
@@ -426,11 +696,126 @@ PutResult InMemoryMetadataStore::put_locked(
 
     const auto [stored, inserted] = values_.insert_or_assign(key, current);
     static_cast<void>(inserted);
+    if (previous.has_value()) {
+        detach_key_locked(*previous);
+    }
     revision_ = mutation_revision;
     return {
         .current = stored->second,
         .previous = std::move(previous),
         .revision = mutation_revision};
+}
+
+LeaseRecord InMemoryMetadataStore::lease_record_locked(
+    const LeaseId id,
+    const StoredLease& lease) const {
+    return {
+        .id = id,
+        .fencing_token = lease.fencing_token,
+        .granted_ttl = lease.granted_ttl,
+        .expiry_tick = lease.expiry_tick,
+        .attached_keys = std::vector<ByteSequence>(
+            lease.attached_keys.begin(),
+            lease.attached_keys.end())};
+}
+
+LeaseLookupResult InMemoryMetadataStore::lookup_lease_locked(
+    const LeaseId id,
+    const LeaseTick tick) const {
+    const auto lease = leases_.find(id);
+    if (lease == leases_.end()) {
+        return {
+            .code = LeaseResultCode::not_found,
+            .revision = revision_};
+    }
+    const LeaseRecord record = lease_record_locked(id, lease->second);
+    if (tick >= lease->second.expiry_tick) {
+        return {
+            .code = LeaseResultCode::expired,
+            .lease = record,
+            .revision = revision_};
+    }
+    return {
+        .code = LeaseResultCode::ok,
+        .lease = record,
+        .remaining_ttl = LeaseDuration{
+            lease->second.expiry_tick.value - tick.value},
+        .revision = revision_};
+}
+
+LeaseCleanupResult InMemoryMetadataStore::remove_leases_locked(
+    const std::vector<LeaseId>& ids,
+    const LeaseResultCode code) {
+    std::vector<KeyValue> deleted;
+    for (const LeaseId id : ids) {
+        const auto lease = leases_.find(id);
+        if (lease == leases_.end()) {
+            throw std::logic_error("lease cleanup references missing lease");
+        }
+        for (const ByteSequence& key : lease->second.attached_keys) {
+            const auto value = values_.find(key);
+            if (value == values_.end() || value->second.lease_id != id.value) {
+                throw std::logic_error("lease attachment index is inconsistent");
+            }
+            deleted.push_back(value->second);
+        }
+    }
+    std::ranges::sort(
+        deleted,
+        {},
+        [](const KeyValue& value) -> const ByteSequence& {
+            return value.key;
+        });
+
+    const std::int64_t cleanup_revision =
+        ids.empty() ? revision_ : next_revision_locked();
+    LeaseCleanupResult result{
+        .code = code,
+        .leases = ids,
+        .deleted_keys = std::move(deleted),
+        .revision = cleanup_revision};
+    std::map<ByteSequence, KeyValue> working_values = values_;
+    std::map<LeaseId, StoredLease> working_leases = leases_;
+    for (const KeyValue& value : result.deleted_keys) {
+        working_values.erase(value.key);
+    }
+    for (const LeaseId id : ids) {
+        working_leases.erase(id);
+    }
+    values_.swap(working_values);
+    leases_.swap(working_leases);
+    revision_ = cleanup_revision;
+    return result;
+}
+
+void InMemoryMetadataStore::detach_key_locked(const KeyValue& value) {
+    detach_key(leases_, value);
+}
+
+void InMemoryMetadataStore::detach_key(
+    std::map<LeaseId, StoredLease>& leases,
+    const KeyValue& value) {
+    if (value.lease_id == 0) {
+        return;
+    }
+    const auto lease = leases.find(LeaseId{value.lease_id});
+    if (lease == leases.end()
+        || lease->second.attached_keys.erase(value.key) != 1) {
+        throw std::logic_error("lease attachment index is inconsistent");
+    }
+}
+
+void InMemoryMetadataStore::attach_key(
+    std::map<LeaseId, StoredLease>& leases,
+    const LeaseId id,
+    const ByteSequence& key) {
+    const auto lease = leases.find(id);
+    if (lease == leases.end()) {
+        throw std::logic_error("verified lease is missing");
+    }
+    if (!lease->second.attached_keys.insert(key).second) {
+        throw std::logic_error("key is already attached to lease");
+    }
 }
 
 std::int64_t InMemoryMetadataStore::next_revision_locked() const {
@@ -443,6 +828,12 @@ std::int64_t InMemoryMetadataStore::next_revision_locked() const {
 void InMemoryMetadataStore::validate_key(const ByteSequence& key) {
     if (key.empty()) {
         throw std::invalid_argument("key must not be empty");
+    }
+}
+
+void InMemoryMetadataStore::validate_tick_locked(const LeaseTick tick) const {
+    if (tick < logical_tick_) {
+        throw std::invalid_argument("lease tick must not move backwards");
     }
 }
 

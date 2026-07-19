@@ -49,8 +49,19 @@ using kura::metadata::CompareTarget;
 using kura::metadata::DeleteRangeResult;
 using kura::metadata::DeleteRequest;
 using kura::metadata::InMemoryMetadataStore;
+using kura::metadata::InMemoryStoreSnapshot;
 using kura::metadata::KeyRange;
 using kura::metadata::KeyValue;
+using kura::metadata::LeaseDuration;
+using kura::metadata::LeaseGrantRequest;
+using kura::metadata::LeaseId;
+using kura::metadata::LeaseKeepAliveRequest;
+using kura::metadata::LeaseOwnership;
+using kura::metadata::LeaseResultCode;
+using kura::metadata::LeaseRevokeRequest;
+using kura::metadata::LeaseTick;
+using kura::metadata::LeaseTimeToLiveRequest;
+using kura::metadata::FencingToken;
 using kura::metadata::PutRequest;
 using kura::metadata::PutResult;
 using kura::metadata::RangeRead;
@@ -93,10 +104,12 @@ KeyRange key_range(
 PutRequest transaction_put(
     const std::string_view key,
     const std::string_view value,
-    const bool return_previous = false) {
+    const bool return_previous = false,
+    const std::int64_t lease_id = 0) {
     return {
         .key = bytes(key),
         .value = bytes(value),
+        .lease_id = lease_id,
         .return_previous = return_previous};
 }
 
@@ -119,9 +132,13 @@ DeleteRequest transaction_delete(
 TransactionRequest transaction_request(
     std::vector<Compare> comparisons,
     std::vector<RequestOperation> success,
-    std::vector<RequestOperation> failure = {}) {
+    std::vector<RequestOperation> failure = {},
+    std::vector<LeaseOwnership> lease_ownership = {},
+    const LeaseTick lease_tick = {}) {
     return {
         .comparisons = std::move(comparisons),
+        .lease_ownership = std::move(lease_ownership),
+        .lease_tick = lease_tick,
         .success = std::move(success),
         .failure = std::move(failure)};
 }
@@ -661,6 +678,361 @@ void transaction_overflow_is_atomic() {
         "version overflow must retain original key");
 }
 
+void lease_grant_keepalive_and_ttl_use_logical_ticks() {
+    InMemoryMetadataStore store;
+    const auto granted = store.grant_lease(LeaseGrantRequest{
+        .requested_id = LeaseId{},
+        .ttl = LeaseDuration{5},
+        .tick = LeaseTick{10}});
+
+    expect(granted.lease.id == LeaseId{1}, "auto lease ID starts at one");
+    expect(
+        granted.lease.fencing_token == FencingToken{1},
+        "first grant gets the first fencing token");
+    expect(
+        granted.lease.expiry_tick == LeaseTick{15},
+        "grant deadline is deterministic logical tick plus TTL");
+    expect(granted.revision == 0, "grant does not mutate key revision");
+
+    const auto ttl = store.time_to_live(
+        LeaseTimeToLiveRequest{.id = LeaseId{1}, .tick = LeaseTick{12}});
+    expect(ttl.code == LeaseResultCode::ok, "live lease TTL lookup succeeds");
+    expect(ttl.remaining_ttl == LeaseDuration{3}, "TTL reports logical ticks");
+
+    const auto kept = store.keep_alive(LeaseKeepAliveRequest{
+        .id = LeaseId{1},
+        .fencing_token = FencingToken{1},
+        .tick = LeaseTick{13}});
+    expect(kept.code == LeaseResultCode::ok, "owner can keep lease alive");
+    expect(
+        kept.lease->expiry_tick == LeaseTick{18}
+            && kept.remaining_ttl == LeaseDuration{5},
+        "keepalive resets the full granted TTL");
+
+    const auto wrong_owner = store.keep_alive(LeaseKeepAliveRequest{
+        .id = LeaseId{1},
+        .fencing_token = FencingToken{2},
+        .tick = LeaseTick{14}});
+    expect(
+        wrong_owner.code == LeaseResultCode::fencing_token_mismatch,
+        "wrong fencing token cannot keep a lease alive");
+    expect(
+        store.time_to_live(
+                 LeaseTimeToLiveRequest{
+                     .id = LeaseId{1},
+                     .tick = LeaseTick{14}})
+                .lease->expiry_tick
+            == LeaseTick{18},
+        "failed keepalive must not change the deadline");
+    expect_throws<std::invalid_argument>(
+        [&store] {
+            static_cast<void>(store.keep_alive(LeaseKeepAliveRequest{
+                .id = LeaseId{1},
+                .fencing_token = FencingToken{1},
+                .tick = LeaseTick{13}}));
+        },
+        "logical command time must never move backwards");
+    expect_throws<std::invalid_argument>(
+        [&store] {
+            static_cast<void>(store.grant_lease(LeaseGrantRequest{
+                .ttl = LeaseDuration{},
+                .tick = LeaseTick{14}}));
+        },
+        "zero TTL must be rejected");
+    const auto empty_expiry = store.expire_leases(LeaseTick{18});
+    expect(
+        empty_expiry.leases == std::vector<LeaseId>{LeaseId{1}}
+            && empty_expiry.deleted_keys.empty()
+            && empty_expiry.revision == 1,
+        "expiry of an unattached lease still has one lifecycle revision");
+}
+
+void lease_revoke_deletes_attached_keys_at_one_revision() {
+    InMemoryMetadataStore store;
+    const auto granted = store.grant_lease(LeaseGrantRequest{
+        .requested_id = LeaseId{7},
+        .ttl = LeaseDuration{20},
+        .tick = LeaseTick{0}});
+    const LeaseOwnership ownership{
+        .id = granted.lease.id,
+        .fencing_token = granted.lease.fencing_token};
+
+    const auto attached = store.transaction(transaction_request(
+        {},
+        {
+            transaction_put("z-key", "z", false, 7),
+            transaction_put("a-key", "a", false, 7),
+        },
+        {},
+        {ownership},
+        LeaseTick{0}));
+    expect(attached.header.revision == 1, "attachment transaction advances once");
+    expect(
+        store.get(bytes("a-key")).value->lease_id == 7,
+        "put stores its lease ID");
+
+    const auto snapshot = store.snapshot();
+    expect(
+        snapshot.leases[0].attached_keys
+            == std::vector<ByteSequence>{bytes("a-key"), bytes("z-key")},
+        "snapshot attachment order is deterministic");
+
+    const auto wrong_revoke = store.revoke_lease(LeaseRevokeRequest{
+        .id = LeaseId{7},
+        .fencing_token = FencingToken{
+            ownership.fencing_token.value + 1},
+        .tick = LeaseTick{1}});
+    expect(
+        wrong_revoke.code == LeaseResultCode::fencing_token_mismatch
+            && wrong_revoke.revision == 1,
+        "stale generation cannot revoke a lease");
+
+    const auto revoked = store.revoke_lease(LeaseRevokeRequest{
+        .id = LeaseId{7},
+        .fencing_token = ownership.fencing_token,
+        .tick = LeaseTick{1}});
+    expect(revoked.code == LeaseResultCode::ok, "owner can revoke lease");
+    expect(revoked.revision == 2, "revoke cleanup advances exactly once");
+    expect(
+        revoked.deleted_keys.size() == 2
+            && revoked.deleted_keys[0].key == bytes("a-key")
+            && revoked.deleted_keys[1].key == bytes("z-key"),
+        "revoke returns deterministic key order");
+    expect(
+        !store.get(bytes("a-key")).value
+            && !store.get(bytes("z-key")).value,
+        "revoke atomically removes every attached key");
+    expect(
+        store.time_to_live(
+                 LeaseTimeToLiveRequest{
+                     .id = LeaseId{7},
+                     .tick = LeaseTick{1}})
+                .code
+            == LeaseResultCode::not_found,
+        "revoked lease is removed");
+    expect(
+        store.revoke_lease(LeaseRevokeRequest{
+            .id = LeaseId{7},
+            .fencing_token = ownership.fencing_token,
+            .tick = LeaseTick{1}})
+                .code
+            == LeaseResultCode::not_found,
+        "unknown revoke has an explicit result");
+    expect(store.revision() == 2, "unknown revoke does not advance revision");
+}
+
+void paused_owner_is_fenced_after_expiry_and_regrant() {
+    InMemoryMetadataStore store;
+    const auto old_lease = store.grant_lease(LeaseGrantRequest{
+        .requested_id = LeaseId{42},
+        .ttl = LeaseDuration{3},
+        .tick = LeaseTick{0}});
+    const LeaseOwnership old_owner{
+        .id = LeaseId{42},
+        .fencing_token = old_lease.lease.fencing_token};
+    static_cast<void>(store.transaction(transaction_request(
+        {},
+        {transaction_put("owner", "old", false, 42)},
+        {},
+        {old_owner},
+        LeaseTick{0})));
+
+    const auto expired_ttl = store.time_to_live(
+        LeaseTimeToLiveRequest{.id = LeaseId{42}, .tick = LeaseTick{3}});
+    expect(
+        expired_ttl.code == LeaseResultCode::expired,
+        "deadline tick classifies the paused owner's lease as expired");
+    const auto expired = store.expire_leases(LeaseTick{3});
+    expect(
+        expired.leases == std::vector<LeaseId>{LeaseId{42}}
+            && expired.revision == 2,
+        "expiry removes the lease and attached key in one batch");
+
+    const auto new_lease = store.grant_lease(LeaseGrantRequest{
+        .requested_id = LeaseId{42},
+        .ttl = LeaseDuration{3},
+        .tick = LeaseTick{3}});
+    expect(
+        new_lease.lease.fencing_token.value
+            > old_lease.lease.fencing_token.value,
+        "reusing a lease ID receives a newer fencing token");
+
+    const auto paused_write = store.transaction(transaction_request(
+        {},
+        {transaction_put("protected", "stale")},
+        {transaction_range("a", "z")},
+        {old_owner},
+        LeaseTick{3}));
+    expect(
+        !paused_write.succeeded && !store.get(bytes("protected")).value,
+        "paused owner cannot write after its generation is fenced");
+
+    const LeaseOwnership new_owner{
+        .id = LeaseId{42},
+        .fencing_token = new_lease.lease.fencing_token};
+    const auto current_write = store.transaction(transaction_request(
+        {},
+        {transaction_put("protected", "current", false, 42)},
+        {},
+        {new_owner},
+        LeaseTick{3}));
+    expect(current_write.succeeded, "current fenced owner can write");
+}
+
+void expiry_batches_are_deterministic_after_a_pause() {
+    InMemoryMetadataStore store;
+    const auto first = store.grant_lease(LeaseGrantRequest{
+        .requested_id = LeaseId{2},
+        .ttl = LeaseDuration{5},
+        .tick = LeaseTick{0}});
+    const auto second = store.grant_lease(LeaseGrantRequest{
+        .requested_id = LeaseId{1},
+        .ttl = LeaseDuration{5},
+        .tick = LeaseTick{0}});
+    static_cast<void>(store.transaction(transaction_request(
+        {},
+        {
+            transaction_put("z", "first", false, 2),
+            transaction_put("a", "second", false, 1),
+        },
+        {},
+        {
+            LeaseOwnership{LeaseId{2}, first.lease.fencing_token},
+            LeaseOwnership{LeaseId{1}, second.lease.fencing_token},
+        },
+        LeaseTick{0})));
+
+    const auto before = store.expire_leases(LeaseTick{4});
+    expect(before.leases.empty(), "leases do not expire before deadline");
+    expect(before.revision == 1, "empty expiry batch keeps revision");
+
+    const auto after_pause = store.expire_leases(LeaseTick{8});
+    expect(
+        after_pause.leases
+            == std::vector<LeaseId>{LeaseId{1}, LeaseId{2}},
+        "overdue leases expire in sorted ID order after a scheduler pause");
+    expect(
+        after_pause.deleted_keys[0].key == bytes("a")
+            && after_pause.deleted_keys[1].key == bytes("z"),
+        "expiry deletion order is independent of attachment order");
+    expect(after_pause.revision == 2, "expiry batch has one mutation revision");
+    expect(store.revision() == 2, "two expired leases do not allocate twice");
+}
+
+void reattachment_updates_indexes_and_round_trips_snapshot() {
+    InMemoryMetadataStore store;
+    const auto short_lease = store.grant_lease(LeaseGrantRequest{
+        .requested_id = LeaseId{10},
+        .ttl = LeaseDuration{5},
+        .tick = LeaseTick{0}});
+    const auto long_lease = store.grant_lease(LeaseGrantRequest{
+        .requested_id = LeaseId{20},
+        .ttl = LeaseDuration{10},
+        .tick = LeaseTick{0}});
+    const LeaseOwnership short_owner{
+        LeaseId{10}, short_lease.lease.fencing_token};
+    const LeaseOwnership long_owner{
+        LeaseId{20}, long_lease.lease.fencing_token};
+    static_cast<void>(store.transaction(transaction_request(
+        {},
+        {transaction_put("key", "short", false, 10)},
+        {},
+        {short_owner},
+        LeaseTick{0})));
+
+    const auto reattached = store.transaction(transaction_request(
+        {Compare{
+            .key = bytes("key"),
+            .target = CompareTarget::lease_id,
+            .result = CompareResult::equal,
+            .expected = std::int64_t{10}}},
+        {transaction_put("key", "long", true, 20)},
+        {},
+        {long_owner},
+        LeaseTick{1}));
+    expect(reattached.succeeded, "lease ID comparison guards reattachment");
+    expect(
+        store.get(bytes("key")).value->lease_id == 20,
+        "reattachment stores the new lease");
+
+    const auto saved = store.snapshot();
+    InMemoryMetadataStore restored(saved);
+    expect(restored.snapshot() == saved, "lease snapshot round trips exactly");
+
+    const auto old_expiry = restored.expire_leases(LeaseTick{5});
+    expect(old_expiry.deleted_keys.empty(), "old lease no longer owns key");
+    expect(
+        restored.get(bytes("key")).value->value == bytes("long"),
+        "old lease expiry cannot delete a reattached key");
+    const auto new_expiry = restored.expire_leases(LeaseTick{10});
+    expect(
+        new_expiry.deleted_keys.size() == 1
+            && !restored.get(bytes("key")).value,
+        "new lease expiry deletes the reattached key");
+}
+
+void leased_put_requires_verified_live_ownership() {
+    InMemoryMetadataStore store;
+    const auto granted = store.grant_lease(LeaseGrantRequest{
+        .ttl = LeaseDuration{2},
+        .tick = LeaseTick{0}});
+
+    expect_throws<std::invalid_argument>(
+        [&store] {
+            static_cast<void>(store.transaction(transaction_request(
+                {},
+                {transaction_put("key", "value", false, 1)})));
+        },
+        "attachment without ownership comparison is invalid");
+    expect(store.revision() == 0, "invalid attachment is atomic");
+
+    const auto result = store.transaction(transaction_request(
+        {},
+        {transaction_put("key", "value", false, 1)},
+        {transaction_range("a", "z")},
+        {LeaseOwnership{LeaseId{1}, granted.lease.fencing_token}},
+        LeaseTick{2}));
+    expect(!result.succeeded, "expired ownership selects failure branch");
+    expect(!store.get(bytes("key")).value, "expired lease cannot gain a key");
+}
+
+void lease_cleanup_revision_overflow_is_atomic() {
+    const KeyValue attached{
+        .key = bytes("key"),
+        .value = bytes("value"),
+        .version = 1,
+        .create_revision = 1,
+        .mod_revision = 1,
+        .lease_id = 1};
+    InMemoryMetadataStore store(InMemoryStoreSnapshot{
+        .values = {attached},
+        .leases = {kura::metadata::LeaseRecord{
+            .id = LeaseId{1},
+            .fencing_token = FencingToken{1},
+            .granted_ttl = LeaseDuration{1},
+            .expiry_tick = LeaseTick{1},
+            .attached_keys = {bytes("key")}}},
+        .revision = std::numeric_limits<std::int64_t>::max(),
+        .logical_tick = LeaseTick{0},
+        .next_lease_id = 2,
+        .next_fencing_token = FencingToken{2}});
+
+    expect_throws<std::overflow_error>(
+        [&store] {
+            static_cast<void>(store.expire_leases(LeaseTick{1}));
+        },
+        "lease cleanup must reject revision exhaustion");
+    expect(
+        store.get(bytes("key")).value == attached
+            && store.time_to_live(
+                         LeaseTimeToLiveRequest{
+                             .id = LeaseId{1},
+                             .tick = LeaseTick{1}})
+                    .code
+                == LeaseResultCode::expired,
+        "failed cleanup must preserve lease and attached key");
+}
+
 void concurrent_kura_publishers_have_one_winner() {
     InMemoryMetadataStore store;
     const auto expected =
@@ -740,6 +1112,13 @@ int main() {
         {"transaction duplicate writes", duplicate_transaction_writes_are_rejected},
         {"transaction atomic validation", invalid_selected_transaction_is_atomic},
         {"transaction overflow", transaction_overflow_is_atomic},
+        {"lease grant keepalive TTL", lease_grant_keepalive_and_ttl_use_logical_ticks},
+        {"lease revoke", lease_revoke_deletes_attached_keys_at_one_revision},
+        {"lease paused owner fencing", paused_owner_is_fenced_after_expiry_and_regrant},
+        {"lease expiry batch", expiry_batches_are_deterministic_after_a_pause},
+        {"lease reattachment snapshot", reattachment_updates_indexes_and_round_trips_snapshot},
+        {"leased put ownership", leased_put_requires_verified_live_ownership},
+        {"lease cleanup overflow", lease_cleanup_revision_overflow_is_atomic},
         {"concurrent transaction publishers", concurrent_kura_publishers_have_one_winner}};
 
     int failures = 0;
