@@ -1,16 +1,23 @@
 #pragma once
 
+#include "kura/metadata/kv/transaction_request.hpp"
+#include "kura/metadata/kv/transaction_result.hpp"
 #include "kura/metadata/metadata_store.hpp"
 
 #include <cstdint>
 #include <map>
 #include <shared_mutex>
+#include <vector>
 
 namespace kura::metadata {
 
 class InMemoryMetadataStore final : public MetadataStore {
 public:
     explicit InMemoryMetadataStore(std::int64_t initial_revision = 0);
+
+    InMemoryMetadataStore(
+        std::vector<KeyValue> initial_values,
+        std::int64_t initial_revision);
 
     [[nodiscard]] StoreRead get(const ByteSequence& key) const override;
 
@@ -28,6 +35,9 @@ public:
         const ByteSequence& key,
         std::int64_t expected_mod_revision,
         const ByteSequence& new_value) override;
+
+    [[nodiscard]] TransactionResult transaction(
+        const TransactionRequest& request) override;
 
     [[nodiscard]] std::int64_t revision() const override;
 

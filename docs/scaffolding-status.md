@@ -9,11 +9,12 @@ Implemented now:
 - Current versioned key state
 - Point and half-open range reads
 - Put, erase, and modification-revision compare-and-set
+- In-memory If/Then/Else transactions with typed range, put, and delete results
+- Atomic multi-key transaction publication using one revision
 - Synchronized concurrent access
 
 Declared but not implemented:
 
-- Full transactions
 - Historical MVCC
 - Watches and leases
 - WAL, snapshots, and durable backend
