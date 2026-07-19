@@ -14,6 +14,9 @@
   correlation plus persistence-before-send ordering.
 - Election-core tests execute seeded deadlines, split votes, vote freshness,
   persistence delays, restart, duplicate grants, and odd-cluster schedules.
+- AppendEntries tests execute prefix mismatch, divergent suffix repair,
+  duplicate/reordered delivery, retry, heartbeat, delayed log persistence,
+  crash recovery, and three-/five-node replication schedules.
 - Linearizability tests analyze complete concurrent client histories.
 - Compatibility tests read every supported durable and protocol version.
 
@@ -38,6 +41,6 @@ seed, fault controls, and selected event history are printed and can be passed
 to `Simulator::replay`.
 
 The deterministic probe validates scheduling and every fault control. The
-election adapter additionally validates the RequestVote-only slice; neither is
-evidence that log replication, committed consensus, or a distributed service
-is implemented.
+Raft adapter additionally validates RequestVote and uncommitted AppendEntries
+replication; neither is evidence that committed consensus or a distributed
+service is implemented.

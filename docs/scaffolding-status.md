@@ -29,14 +29,16 @@ Implemented now:
 - C++23 Kura helper with RAII writer/reader leases, fenced publication,
   reader-protected metadata collection, and watch compaction resynchronization
 - In-process backend adapter and deterministic uncertain-response fault seam
+- Deterministic AppendEntries heartbeats, conflict repair, leader
+  nextIndex/matchIndex retry, and persistence-gated follower success
 
 Declared but not implemented:
 
 - Historical MVCC
 - Integration of state-machine commands with the WAL and snapshot body
 - Embedded durable backend
-- AppendEntries, replicated commit/apply, production Raft transport,
-  membership, snapshots, and ReadIndex
+- Majority commit/apply, production Raft transport, membership, snapshots, and
+  ReadIndex
 - Network server, authentication, and metrics
 - Remote client transport and real leader-failover integration
 

@@ -317,9 +317,9 @@ Public errors will distinguish:
 
 Errors must never turn an uncertain write into a success-shaped response.
 
-## 10. Internal Raft election boundary
+## 10. Internal Raft election and replication boundary
 
-The first internal Raft-core slice is event driven:
+The internal Raft core is event driven:
 
 ```text
 Core(self, peers, recoveredHardState, seed, timeoutRange, localLog)
@@ -329,11 +329,16 @@ snapshot()              -> immutable diagnostic state
 ```
 
 Inputs are logical election deadlines, RequestVote requests/responses, and the
-existing explicit hard-state completion event. Effects expose role changes,
-hard-state persistence requests, outbound RequestVote messages, and election
-timer reset/cancel operations. Timeout selection is deterministic from an
-explicit seed and inclusive logical-tick range; the core never reads a clock.
+existing explicit hard-state completion event. Slice 2 adds heartbeat
+deadlines, typed AppendEntries requests/responses, local command proposals, and
+explicit complete-log persistence/completion events. Effects expose role
+changes, hard-state/log persistence requests, outbound RPCs, and timer
+reset/cancel operations.
 
-This boundary reports a leader after a fixed odd-cluster vote quorum but does
-not replicate or commit log entries. Details and ordering guarantees are in
-[Design 0009](design/0009-raft-election-core.md).
+Timeout selection is deterministic from an explicit seed and inclusive
+logical-tick range; the core never reads a clock. Followers match the previous
+term/index, strictly replace only conflicting suffixes, and withhold success
+until changed logs are durable. Leaders initialize and update
+`nextIndex`/`matchIndex` and retry by backtracking. This boundary does not
+advance commit or apply commands. Details are in [Design 0009](design/0009-raft-election-core.md)
+and [Design 0011](design/0011-raft-append-entries.md).

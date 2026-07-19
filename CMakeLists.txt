@@ -167,4 +167,20 @@ if(BUILD_TESTING)
     endif()
 
     add_test(NAME kura_client_tests COMMAND kura_client_tests)
+
+    add_executable(
+        kura_raft_append_entries_tests
+        tests/raft_append_entries_test.cpp)
+
+    target_link_libraries(kura_raft_append_entries_tests PRIVATE kura_metadata)
+
+    if(MSVC)
+        target_compile_options(kura_raft_append_entries_tests PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(kura_raft_append_entries_tests PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+
+    add_test(
+        NAME kura_raft_append_entries_tests
+        COMMAND kura_raft_append_entries_tests)
 endif()
