@@ -16,9 +16,10 @@ WAL, networking, and state-machine execution.
 
 > **Current status:** Phase 1 is a single-node, in-memory deterministic state
 > machine. A Phase 3 WAL/snapshot storage boundary exists but is not connected
-> to mutation responses or a transactional backend. The service is not
-> distributed, replicated, durably integrated, or highly available. Do not use
-> it for production metadata.
+> to mutation responses or a transactional backend. A deterministic
+> logical-time Raft simulation harness exists, but the Raft core does not. The
+> service is not distributed, replicated, durably integrated, or highly
+> available. Do not use it for production metadata.
 
 ## Why build it?
 
@@ -112,6 +113,7 @@ not read a wall clock, and no background expiry driver is implemented.
 - [ADR-0003: internal Raft implementation](docs/decisions/0003-internal-raft.md)
 - [Brand assets and usage](docs/brand.md)
 - [Durable WAL and snapshot design](docs/design/0005-durable-wal-snapshots.md)
+- [Deterministic Raft simulator design](docs/design/0006-deterministic-raft-simulator.md)
 - [WAL format v1](docs/formats/wal-v1.md)
 - [Snapshot format v1](docs/formats/snapshot-v1.md)
 

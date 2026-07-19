@@ -25,7 +25,8 @@ add_library(
     src/byte_sequence.cpp
     src/durable_storage.cpp
     src/key_range.cpp
-    src/in_memory_metadata_store.cpp)
+    src/in_memory_metadata_store.cpp
+    src/raft_simulation.cpp)
 
 target_include_directories(
     kura_metadata
@@ -84,4 +85,20 @@ if(BUILD_TESTING)
     add_test(
         NAME kura_durable_storage_tests
         COMMAND kura_durable_storage_tests)
+
+    add_executable(
+        kura_raft_simulation_tests
+        tests/raft_simulation_test.cpp)
+
+    target_link_libraries(kura_raft_simulation_tests PRIVATE kura_metadata)
+
+    if(MSVC)
+        target_compile_options(kura_raft_simulation_tests PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(kura_raft_simulation_tests PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+
+    add_test(
+        NAME kura_raft_simulation_tests
+        COMMAND kura_raft_simulation_tests)
 endif()
