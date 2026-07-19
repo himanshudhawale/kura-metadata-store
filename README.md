@@ -112,6 +112,7 @@ not read a wall clock, and no background expiry driver is implemented.
 - [ADR-0003: internal Raft implementation](docs/decisions/0003-internal-raft.md)
 - [Brand assets and usage](docs/brand.md)
 - [Durable WAL and snapshot design](docs/design/0005-durable-wal-snapshots.md)
+- [Executable Raft Figure 2 design](docs/design/0006-executable-raft-figure-2.md)
 - [WAL format v1](docs/formats/wal-v1.md)
 - [Snapshot format v1](docs/formats/snapshot-v1.md)
 
