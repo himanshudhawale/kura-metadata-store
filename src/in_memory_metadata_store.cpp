@@ -3,6 +3,7 @@
 #include "kura/metadata/core/store_error.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
@@ -266,9 +267,16 @@ TransactionResult InMemoryMetadataStore::transaction(
                     }
                 } else if constexpr (std::is_same_v<Operation, PutRequest>) {
                     validate_key(typed_operation.key);
-                    if (typed_operation.lease_id != 0) {
+                    if (typed_operation.lease_id < 0) {
                         throw std::invalid_argument(
-                            "nonzero lease IDs are not implemented");
+                            "lease ID must not be negative");
+                    }
+                    if (typed_operation.lease_id != 0
+                        && !leases_.contains(
+                            LeaseId{typed_operation.lease_id})) {
+                        throw StoreError(
+                            StatusCode::lease_not_found,
+                            "transaction references an unknown lease");
                     }
                     if (std::ranges::find(put_keys, typed_operation.key)
                         != put_keys.end()) {
@@ -372,7 +380,7 @@ TransactionResult InMemoryMetadataStore::transaction(
                             ? previous->create_revision
                             : transaction_revision,
                         .mod_revision = transaction_revision,
-                        .lease_id = 0};
+                        .lease_id = typed_operation.lease_id};
                     const auto [stored, inserted] =
                         working.insert_or_assign(
                             typed_operation.key,
@@ -433,6 +441,130 @@ TransactionResult InMemoryMetadataStore::transaction(
         .header = ResponseHeader{.revision = transaction_revision},
         .succeeded = comparisons_succeeded,
         .responses = std::move(responses)};
+}
+
+LeaseResponse InMemoryMetadataStore::grant_lease(
+    const LeaseGrantRequest& request,
+    const Clock::TimePoint now) {
+    if (request.requested_id.value < 0) {
+        throw StoreError(
+            StatusCode::invalid_argument,
+            "requested lease ID must not be negative");
+    }
+    if (request.ttl <= std::chrono::seconds::zero()) {
+        throw StoreError(
+            StatusCode::invalid_argument,
+            "lease TTL must be positive");
+    }
+    if (Clock::TimePoint::max() - now < request.ttl) {
+        throw StoreError(
+            StatusCode::invalid_argument,
+            "lease deadline exceeds the clock range");
+    }
+
+    const std::unique_lock lock(mutex_);
+    if (leases_.size() >= limits_.max_active_leases) {
+        throw StoreError(
+            StatusCode::quota_exceeded,
+            "active lease limit reached");
+    }
+    const LeaseId id = request.requested_id.value == 0
+        ? next_lease_id_locked()
+        : request.requested_id;
+    if (leases_.contains(id)) {
+        throw StoreError(
+            StatusCode::invalid_argument,
+            "lease ID is already active");
+    }
+    leases_.emplace(
+        id,
+        LeaseState{
+            .id = id,
+            .granted_ttl = request.ttl,
+            .deadline = now + request.ttl});
+    return {
+        .header = ResponseHeader{.revision = revision_},
+        .lease = LeaseRecord{
+            .id = id,
+            .granted_ttl = request.ttl,
+            .remaining_ttl = request.ttl}};
+}
+
+LeaseResponse InMemoryMetadataStore::keep_alive(
+    const LeaseKeepAliveRequest& request,
+    const Clock::TimePoint now) {
+    const std::unique_lock lock(mutex_);
+    const auto iterator = leases_.find(request.id);
+    if (iterator == leases_.end()) {
+        throw StoreError(
+            StatusCode::lease_not_found,
+            "cannot renew an unknown lease");
+    }
+    LeaseState& lease = iterator->second;
+    if (Clock::TimePoint::max() - now < lease.granted_ttl) {
+        throw StoreError(
+            StatusCode::invalid_argument,
+            "lease deadline exceeds the clock range");
+    }
+    lease.deadline = now + lease.granted_ttl;
+    return {
+        .header = ResponseHeader{.revision = revision_},
+        .lease = LeaseRecord{
+            .id = lease.id,
+            .granted_ttl = lease.granted_ttl,
+            .remaining_ttl = lease.granted_ttl}};
+}
+
+LeaseResponse InMemoryMetadataStore::time_to_live(
+    const LeaseId id,
+    const Clock::TimePoint now) const {
+    const std::shared_lock lock(mutex_);
+    const auto iterator = leases_.find(id);
+    if (iterator == leases_.end()) {
+        throw StoreError(
+            StatusCode::lease_not_found,
+            "unknown lease");
+    }
+    return {
+        .header = ResponseHeader{.revision = revision_},
+        .lease = LeaseRecord{
+            .id = id,
+            .granted_ttl = iterator->second.granted_ttl,
+            .remaining_ttl = remaining_ttl(iterator->second, now)}};
+}
+
+LeaseResponse InMemoryMetadataStore::revoke_lease(
+    const LeaseRevokeRequest& request) {
+    const std::unique_lock lock(mutex_);
+    const auto iterator = leases_.find(request.id);
+    if (iterator == leases_.end()) {
+        throw StoreError(
+            StatusCode::lease_not_found,
+            "cannot revoke an unknown lease");
+    }
+    return remove_leases_locked(
+        {request.id},
+        request.id,
+        iterator->second.granted_ttl);
+}
+
+std::size_t InMemoryMetadataStore::expire_leases(
+    const Clock::TimePoint now) {
+    const std::unique_lock lock(mutex_);
+    std::vector<LeaseId> expired;
+    for (const auto& [id, lease] : leases_) {
+        if (lease.deadline <= now) {
+            expired.push_back(id);
+        }
+    }
+    if (expired.empty()) {
+        return 0;
+    }
+    static_cast<void>(remove_leases_locked(
+        expired,
+        expired.front(),
+        leases_.at(expired.front()).granted_ttl));
+    return expired.size();
 }
 
 PutResult InMemoryMetadataStore::put_locked(
@@ -697,6 +829,95 @@ void InMemoryMetadataStore::commit_watch_publication_locked(
     history_.swap(publication.history);
     watchers_.swap(publication.watchers);
     compact_revision_ = publication.compact_revision;
+}
+
+LeaseResponse InMemoryMetadataStore::remove_leases_locked(
+    const std::vector<LeaseId>& ids,
+    const LeaseId response_id,
+    const std::chrono::seconds granted_ttl) {
+    std::map<ByteSequence, KeyValue> working_values = values_;
+    std::map<LeaseId, LeaseState> working_leases = leases_;
+    std::vector<WatchEvent> events;
+    const bool has_attached_keys = std::ranges::any_of(
+        values_,
+        [&ids](const auto& entry) {
+            return std::ranges::find(
+                       ids,
+                       LeaseId{entry.second.lease_id})
+                != ids.end();
+        });
+    const std::int64_t mutation_revision =
+        has_attached_keys ? next_revision_locked() : revision_;
+
+    for (auto iterator = working_values.begin();
+         iterator != working_values.end();) {
+        if (std::ranges::find(
+                ids,
+                LeaseId{iterator->second.lease_id})
+            == ids.end()) {
+            ++iterator;
+            continue;
+        }
+        const KeyValue previous = iterator->second;
+        events.push_back(WatchEvent{
+            .revision = Revision{mutation_revision},
+            .mutation = MutationEvent{
+                .type = MutationEventType::erase,
+                .current = std::nullopt,
+                .previous = previous}});
+        iterator = working_values.erase(iterator);
+    }
+    for (const LeaseId id : ids) {
+        working_leases.erase(id);
+    }
+
+    std::optional<StagedWatchPublication> publication;
+    if (has_attached_keys) {
+        publication =
+            stage_watch_publication_locked(events, mutation_revision);
+    }
+    values_.swap(working_values);
+    leases_.swap(working_leases);
+    revision_ = mutation_revision;
+    if (publication.has_value()) {
+        commit_watch_publication_locked(*publication);
+    }
+    return {
+        .header = ResponseHeader{.revision = revision_},
+        .lease = LeaseRecord{
+            .id = response_id,
+            .granted_ttl = granted_ttl,
+            .remaining_ttl = std::chrono::seconds::zero()}};
+}
+
+LeaseId InMemoryMetadataStore::next_lease_id_locked() {
+    while (next_lease_id_ > 0
+           && leases_.contains(LeaseId{next_lease_id_})) {
+        if (next_lease_id_ == std::numeric_limits<std::int64_t>::max()) {
+            throw std::overflow_error("lease ID space exhausted");
+        }
+        ++next_lease_id_;
+    }
+    if (next_lease_id_ <= 0) {
+        throw std::overflow_error("lease ID space exhausted");
+    }
+    const LeaseId result{next_lease_id_};
+    if (next_lease_id_ == std::numeric_limits<std::int64_t>::max()) {
+        next_lease_id_ = 0;
+    } else {
+        ++next_lease_id_;
+    }
+    return result;
+}
+
+std::chrono::seconds InMemoryMetadataStore::remaining_ttl(
+    const LeaseState& lease,
+    const Clock::TimePoint now) {
+    if (now >= lease.deadline) {
+        return std::chrono::seconds::zero();
+    }
+    return std::chrono::ceil<std::chrono::seconds>(
+        lease.deadline - now);
 }
 
 bool InMemoryMetadataStore::watch_matches(

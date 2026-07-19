@@ -13,12 +13,13 @@ Implemented now:
 - Atomic multi-key transaction publication using one revision
 - In-process exact-key and range watches with bounded resumable event history
 - Atomic transaction watch batches, filters, progress, and cancellation
+- In-memory lease grant, keepalive, TTL, revoke, expiry, and key attachment
+- Atomic lease cascade deletion and transaction lease fencing
 - Synchronized concurrent access
 
 Declared but not implemented:
 
 - Historical MVCC
-- Leases
 - Network watch streaming and persistent watch history
 - WAL, snapshots, and durable backend
 - Raft and membership
