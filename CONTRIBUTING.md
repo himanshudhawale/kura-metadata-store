@@ -33,13 +33,15 @@ formats, protocols, consistency guarantees, and public APIs do.
 
 Requirements:
 
-- Java 21
-- Maven 3.9 or newer
+- A C++23 compiler
+- CMake 3.25 or newer
 
 Run:
 
 ```shell
-mvn test
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+cmake --build build --config Debug
+ctest --test-dir build -C Debug --output-on-failure
 ```
 
 Pull requests should:
@@ -50,5 +52,9 @@ Pull requests should:
 - Update documentation with public behavior.
 - Avoid unrelated formatting or refactoring.
 - Explain failure behavior and compatibility impact.
+
+C++ contributions must use RAII, avoid owning raw pointers, preserve explicit
+ownership at API boundaries, and include sanitizer-friendly tests for unsafe
+input or concurrency behavior.
 
 By submitting a contribution, you agree that it is licensed under Apache-2.0.
