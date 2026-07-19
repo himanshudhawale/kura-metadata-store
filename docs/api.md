@@ -264,7 +264,35 @@ durable serialization itself.
 Full rationale and edge cases are documented in
 [Design 0004: Lease Lifecycle and Fenced Ownership](design/0004-lease-lifecycle-and-fencing.md).
 
-## 7. Request idempotency
+## 7. Kura metadata helper
+
+The C++23 `KuraClient` safely composes the in-process transaction, lease, and
+watch APIs:
+
+```text
+acquire_writer(table, ttl) -> WriterGuard
+publish_snapshot(guard, expected_revision, pointer) -> PublishResult
+register_reader(table, pointer, ttl) -> ReaderGuard
+await_snapshot_change(table, from_revision, timeout) -> optional SnapshotUpdate
+collect_snapshot(table, snapshot_id) -> bool
+```
+
+Writer and reader guards are move-only. They own periodic keepalive and
+best-effort revoke-on-destruction. Publication verifies the current
+modification revision, writer-key lease attachment, and exact fencing
+generation in one transaction. Reader registration verifies the exact stored
+snapshot before attaching its lease-backed registration.
+
+`await_snapshot_change` resumes at `from_revision + 1`. On compaction it reads
+current and marks `full_resynchronization`, requiring replacement of cached
+state. `collect_snapshot` never removes current or reader-protected metadata.
+
+`InProcessKuraMetadataBackend` provides these guarantees only among callers
+using the same adapter. It is neither a remote client nor evidence of
+distributed linearizability or leader failover. See
+[Design 0010](design/0010-kura-metadata-helper-client.md).
+
+## 8. Request idempotency
 
 Mutating requests may contain `(clientId, sequenceNumber)`. The state machine
 stores the original response for a bounded period. Retrying the same identifier
@@ -272,7 +300,7 @@ returns that response rather than applying the mutation twice.
 
 Deduplication state must be replicated and included in snapshots.
 
-## 8. Errors
+## 9. Errors
 
 Public errors will distinguish:
 
@@ -289,7 +317,7 @@ Public errors will distinguish:
 
 Errors must never turn an uncertain write into a success-shaped response.
 
-## 9. Internal Raft election boundary
+## 10. Internal Raft election boundary
 
 The first internal Raft-core slice is event driven:
 

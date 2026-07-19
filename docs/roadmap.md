@@ -120,6 +120,11 @@ Exit criteria:
 
 ## Phase 6: Kura integration
 
+**Status:** Started. The in-process C++23 helper, fenced writer publication,
+leased reader registration, atomic adapter-local collection check, and
+compaction resynchronization are implemented. Remote transport and real
+leader-failure coverage depend on Phases 3 and 4.
+
 Deliver:
 
 - Versioned `/kura/v1/` namespace
@@ -128,6 +133,14 @@ Deliver:
 - Reader registration and cleanup protection
 - Watch-based cache invalidation
 - Kura end-to-end compatibility tests
+
+Implemented in this slice:
+
+- Move-only writer and reader guards with automatic keepalive and cleanup
+- Single-transaction fenced snapshot publication
+- Reader-protected snapshot metadata collection
+- Retained watch replay and compacted-watch full resynchronization
+- Deterministic post-commit uncertain-response fault testing
 
 Exit criteria:
 
