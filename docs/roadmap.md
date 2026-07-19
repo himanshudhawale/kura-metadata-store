@@ -27,8 +27,9 @@ Exit criteria:
 ## Phase 2: Full transactional state machine
 
 **Status:** Started. The current in-memory slice implements general
-If/Then/Else transactions and multi-key single-revision mutations only.
-Historical MVCC, watches, leases, and request deduplication remain unimplemented.
+If/Then/Else transactions, multi-key single-revision mutations, and deterministic
+lease lifecycle with fenced ownership. Historical MVCC, watches, and request
+deduplication remain unimplemented.
 
 Deliver:
 

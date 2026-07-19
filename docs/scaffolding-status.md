@@ -11,12 +11,15 @@ Implemented now:
 - Put, erase, and modification-revision compare-and-set
 - In-memory If/Then/Else transactions with typed range, put, and delete results
 - Atomic multi-key transaction publication using one revision
+- Deterministic lease grant, keepalive, TTL, revoke, and expiry
+- Fenced transaction ownership, key attachment, and atomic cascade deletion
+- Canonical in-memory key/lease snapshot representation
 - Synchronized concurrent access
 
 Declared but not implemented:
 
 - Historical MVCC
-- Watches and leases
+- Watches
 - WAL, snapshots, and durable backend
 - Raft and membership
 - Network server, authentication, and metrics
