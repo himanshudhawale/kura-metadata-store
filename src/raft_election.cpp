@@ -1,4 +1,5 @@
 #include "kura/metadata/raft/election.hpp"
+#include "kura/metadata/storage/checksum.hpp"
 
 #include <algorithm>
 #include <array>
@@ -17,6 +18,9 @@ constexpr std::uint8_t append_entries_tag = 4;
 constexpr std::uint8_t append_entries_response_tag = 5;
 constexpr std::uint8_t log_state_tag = 6;
 constexpr std::uint8_t applied_state_tag = 7;
+constexpr std::uint8_t install_snapshot_tag = 8;
+constexpr std::uint8_t install_snapshot_response_tag = 9;
+constexpr std::uint8_t snapshot_state_tag = 10;
 
 void append_u32(simulation::Bytes& bytes, const std::uint32_t value) {
     for (unsigned shift = 0; shift < 32; shift += 8) {
@@ -51,11 +55,63 @@ std::uint64_t read_u64(
     if (offset > bytes.size() || bytes.size() - offset < sizeof(std::uint64_t)) {
         throw std::invalid_argument("truncated Raft payload");
     }
+
     std::uint64_t value = 0;
     for (unsigned shift = 0; shift < 64; shift += 8) {
         value |= static_cast<std::uint64_t>(bytes[offset++]) << shift;
     }
     return value;
+}
+
+void encode_metadata(
+    simulation::Bytes& bytes,
+    const SnapshotMetadata& metadata) {
+    append_u64(bytes, metadata.last_included_index.value);
+    append_u64(bytes, metadata.last_included_term.value);
+    append_u64(
+        bytes, static_cast<std::uint64_t>(metadata.store_revision.value));
+    append_u64(
+        bytes,
+        static_cast<std::uint64_t>(metadata.compaction_revision.value));
+    append_u32(bytes, metadata.format_version);
+    append_u64(bytes, metadata.membership.voters.size());
+    for (const auto node : metadata.membership.voters) {
+        append_u64(bytes, node.value);
+    }
+    append_u64(bytes, metadata.membership.learners.size());
+    for (const auto node : metadata.membership.learners) {
+        append_u64(bytes, node.value);
+    }
+}
+
+SnapshotMetadata decode_metadata(
+    const simulation::Bytes& bytes,
+    std::size_t& offset) {
+    SnapshotMetadata metadata{
+        .last_included_index = {read_u64(bytes, offset)},
+        .last_included_term = {read_u64(bytes, offset)},
+        .store_revision = {
+            static_cast<std::int64_t>(read_u64(bytes, offset))},
+        .compaction_revision = {
+            static_cast<std::int64_t>(read_u64(bytes, offset))},
+        .format_version = read_u32(bytes, offset)};
+    const auto voters = read_u64(bytes, offset);
+    if (voters > (bytes.size() - offset) / 8) {
+        throw std::invalid_argument("invalid snapshot voter count");
+    }
+    for (std::uint64_t index = 0; index < voters; ++index) {
+        metadata.membership.voters.push_back(
+            NodeId{read_u64(bytes, offset)});
+    }
+    const auto learners = read_u64(bytes, offset);
+    if (learners > (bytes.size() - offset) / 8) {
+        throw std::invalid_argument("invalid snapshot learner count");
+    }
+    for (std::uint64_t index = 0; index < learners; ++index) {
+        metadata.membership.learners.push_back(
+            NodeId{read_u64(bytes, offset)});
+    }
+    return metadata;
 }
 
 void encode_entry(simulation::Bytes& bytes, const LogEntry& entry) {
@@ -164,6 +220,68 @@ simulation::Bytes encode(const AppendEntriesResponse& response) {
     return bytes;
 }
 
+simulation::Bytes encode(const InstallSnapshotRequest& request) {
+    simulation::Bytes bytes;
+    bytes.push_back(install_snapshot_tag);
+    append_u64(bytes, request.term.value);
+    append_u64(bytes, request.leader.value);
+    append_u64(bytes, request.transfer_id);
+    encode_metadata(bytes, request.metadata);
+    append_u64(bytes, request.offset);
+    append_u64(bytes, request.total_size);
+    append_u32(bytes, request.state_checksum);
+    bytes.push_back(request.done ? 1 : 0);
+    encode_context(bytes, request.read_context);
+    append_u64(bytes, request.chunk.size());
+    bytes.insert(bytes.end(), request.chunk.begin(), request.chunk.end());
+    return bytes;
+}
+
+simulation::Bytes encode(const InstallSnapshotResponse& response) {
+    simulation::Bytes bytes;
+    bytes.push_back(install_snapshot_response_tag);
+    append_u64(bytes, response.term.value);
+    append_u64(bytes, response.transfer_id);
+    bytes.push_back(response.succeeded ? 1 : 0);
+    append_u64(bytes, response.last_included_index.value);
+    encode_context(bytes, response.read_context);
+    return bytes;
+}
+
+simulation::Bytes encode_snapshot_state(const RaftSnapshot& value) {
+    simulation::Bytes bytes;
+    bytes.push_back(snapshot_state_tag);
+    encode_metadata(bytes, value.metadata);
+    append_u32(bytes, crc32c(value.state));
+    append_u64(bytes, value.state.size());
+    bytes.insert(bytes.end(), value.state.begin(), value.state.end());
+    return bytes;
+}
+
+RaftSnapshot decode_snapshot_state(
+    const simulation::Bytes& bytes) {
+    if (bytes.empty() || bytes.front() != snapshot_state_tag) {
+        throw std::invalid_argument("invalid simulated Raft snapshot");
+    }
+    std::size_t offset = 1;
+    auto metadata = decode_metadata(bytes, offset);
+    const auto checksum = read_u32(bytes, offset);
+    const auto size = read_u64(bytes, offset);
+    if (size > bytes.size() - offset) {
+        throw std::invalid_argument("truncated simulated Raft snapshot");
+    }
+    std::vector<std::uint8_t> state(
+        bytes.begin() + static_cast<std::ptrdiff_t>(offset),
+        bytes.end());
+    if (state.size() != size || crc32c(state) != checksum) {
+        throw std::invalid_argument("corrupt simulated Raft snapshot");
+    }
+    return {
+        .metadata = std::move(metadata),
+        .state = std::move(state),
+        .checksum = checksum};
+}
+
 simulation::Bytes encode(const RaftHardState& state) {
     simulation::Bytes bytes;
     bytes.reserve(18);
@@ -261,7 +379,9 @@ using DecodedMessage = std::variant<
     RequestVoteRequest,
     RequestVoteResponse,
     AppendEntriesRequest,
-    AppendEntriesResponse>;
+    AppendEntriesResponse,
+    InstallSnapshotRequest,
+    InstallSnapshotResponse>;
 
 DecodedMessage decode_message(
     const simulation::Bytes& bytes) {
@@ -315,6 +435,54 @@ DecodedMessage decode_message(
         }
         return AppendEntriesResponse{
             {term}, succeeded != 0, {matched}, context};
+    }
+    if (bytes.front() == install_snapshot_tag) {
+        InstallSnapshotRequest request;
+        request.term = {read_u64(bytes, offset)};
+        request.leader = {read_u64(bytes, offset)};
+        request.transfer_id = read_u64(bytes, offset);
+        request.metadata = decode_metadata(bytes, offset);
+        request.offset = read_u64(bytes, offset);
+        request.total_size = read_u64(bytes, offset);
+        request.state_checksum = read_u32(bytes, offset);
+        if (offset >= bytes.size()) {
+            throw std::invalid_argument("truncated InstallSnapshot");
+        }
+        const auto done = bytes[offset++];
+        if (done > 1) {
+            throw std::invalid_argument("invalid InstallSnapshot done flag");
+        }
+        request.done = done != 0;
+        request.read_context = decode_context(bytes, offset);
+        const auto size = read_u64(bytes, offset);
+        if (size > bytes.size() - offset) {
+            throw std::invalid_argument("truncated InstallSnapshot chunk");
+        }
+        request.chunk.assign(
+            bytes.begin() + static_cast<std::ptrdiff_t>(offset),
+            bytes.end());
+        if (request.chunk.size() != size) {
+            throw std::invalid_argument("invalid InstallSnapshot chunk size");
+        }
+        return request;
+    }
+    if (bytes.front() == install_snapshot_response_tag) {
+        InstallSnapshotResponse response{
+            .term = {read_u64(bytes, offset)},
+            .transfer_id = read_u64(bytes, offset)};
+        if (offset >= bytes.size()) {
+            throw std::invalid_argument(
+                "truncated InstallSnapshot response");
+        }
+        const auto succeeded = bytes[offset++];
+        response.last_included_index = {read_u64(bytes, offset)};
+        response.read_context = decode_context(bytes, offset);
+        if (succeeded > 1 || offset != bytes.size()) {
+            throw std::invalid_argument(
+                "invalid InstallSnapshot response");
+        }
+        response.succeeded = succeeded != 0;
+        return response;
     }
     throw std::invalid_argument("unknown Raft election message");
 }
@@ -397,12 +565,34 @@ public:
                 std::make_move_iterator(proposal.end()));
         }
         const auto snapshot = core_->snapshot();
+        if (!snapshot.waiting_for_persistence
+            && next_snapshot_ < config_.snapshots_on_apply.size()
+            && config_.snapshots_on_apply[next_snapshot_].applied_index
+                == snapshot.last_applied
+            && (!snapshot.snapshot_metadata
+                || snapshot.snapshot_metadata->last_included_index
+                    < snapshot.last_applied)) {
+            auto created = translate(core_->step(
+                config_.snapshots_on_apply[next_snapshot_++]));
+            actions.insert(
+                actions.end(),
+                std::make_move_iterator(created.begin()),
+                std::make_move_iterator(created.end()));
+        }
+        const auto after_snapshot = core_->snapshot();
+        const auto base = after_snapshot.snapshot_metadata
+            ? after_snapshot.snapshot_metadata->last_included_index.value
+            : 0;
         const bool current_term_committed =
-            snapshot.commit_index != LogIndex{}
-            && snapshot.log.at(snapshot.commit_index.value - 1).term
-                == snapshot.hard_state.current_term;
-        if (snapshot.role == RaftRole::leader
-            && !snapshot.waiting_for_persistence
+            after_snapshot.commit_index != LogIndex{}
+            && (after_snapshot.commit_index.value == base
+                    ? after_snapshot.snapshot_metadata
+                          ->last_included_term
+                    : after_snapshot.log.at(
+                          after_snapshot.commit_index.value - base - 1).term)
+                == after_snapshot.hard_state.current_term;
+        if (after_snapshot.role == RaftRole::leader
+            && !after_snapshot.waiting_for_persistence
             && current_term_committed
             && next_read_request_ < config_.reads_on_leadership.size()) {
             auto read = translate(core_->step(
@@ -425,6 +615,7 @@ private:
         RaftHardState recovered;
         std::vector<LogEntry> recovered_log;
         LogIndex recovered_applied;
+        std::optional<RaftSnapshot> recovered_snapshot;
         for (const auto& record : event.durable_records) {
             if (record.bytes.empty()) {
                 throw std::invalid_argument("empty simulated Raft record");
@@ -442,6 +633,15 @@ private:
                         "simulated applied index regressed");
                 }
                 recovered_applied = applied;
+            } else if (record.bytes.front() == snapshot_state_tag) {
+                const auto decoded = decode_snapshot_state(record.bytes);
+                if (recovered_snapshot
+                    && decoded.metadata.last_included_index
+                        <= recovered_snapshot->metadata.last_included_index) {
+                    throw std::invalid_argument(
+                        "simulated Raft snapshot regressed");
+                }
+                recovered_snapshot = decoded;
             } else {
                 throw std::invalid_argument("unknown simulated Raft record");
             }
@@ -460,7 +660,8 @@ private:
             config_.heartbeat_interval,
             recovered_applied,
             config_.max_pending_reads,
-            config_.max_read_history);
+            config_.max_read_history,
+            std::move(recovered_snapshot));
         auto actions = translate(core_->start());
         observe();
         return actions;
@@ -487,10 +688,24 @@ private:
                 return translate(core_->step(figure2::ReceiveAppendEntries{
                     .from = message->from, .request = *request}));
             }
-            return translate(core_->step(
-                figure2::ReceiveAppendEntriesResponse{
+            if (const auto* response =
+                    std::get_if<AppendEntriesResponse>(&decoded)) {
+                return translate(core_->step(
+                    figure2::ReceiveAppendEntriesResponse{
+                        .from = message->from,
+                        .response = *response}));
+            }
+            if (const auto* request =
+                    std::get_if<InstallSnapshotRequest>(&decoded)) {
+                return translate(core_->step(ReceiveInstallSnapshot{
                     .from = message->from,
-                    .response = std::get<AppendEntriesResponse>(decoded)}));
+                    .request = *request}));
+            }
+            return translate(core_->step(
+                ReceiveInstallSnapshotResponse{
+                    .from = message->from,
+                    .response =
+                        std::get<InstallSnapshotResponse>(decoded)}));
         }
         if (std::holds_alternative<simulation::TimerEvent>(event)) {
             const auto timer = std::get<simulation::TimerEvent>(event);
@@ -507,6 +722,13 @@ private:
                 return translate(core_->step(RaftLogPersisted{
                     .request_id = persisted->request_id,
                     .log = pending->log}));
+            }
+            if (const auto* pending =
+                    core_->pending_snapshot_persistence();
+                pending && pending->request_id == persisted->request_id) {
+                return translate(core_->step(RaftSnapshotPersisted{
+                    .request_id = persisted->request_id,
+                    .snapshot = pending->snapshot}));
             }
             const auto& specification = core_->specification_state();
             if (specification.pending_hard_state
@@ -531,9 +753,10 @@ private:
 
     std::vector<simulation::NodeAction> translate(StepResult result) {
         std::vector<simulation::NodeAction> actions;
+        std::vector<RestoreStateMachineSnapshot> restores;
         for (const auto& effect : result.effects) {
             std::visit(
-                [&actions](const auto& typed) {
+                [&actions, &restores](const auto& typed) {
                     using Typed = std::decay_t<decltype(typed)>;
                     if constexpr (
                         std::is_same_v<Typed, PersistRaftHardState>) {
@@ -545,6 +768,11 @@ private:
                         actions.emplace_back(simulation::PersistAction{
                             .request_id = typed.request_id,
                             .bytes = encode_log(typed.log)});
+                    } else if constexpr (
+                        std::is_same_v<Typed, PersistRaftSnapshot>) {
+                        actions.emplace_back(simulation::PersistAction{
+                            .request_id = typed.request_id,
+                            .bytes = encode_snapshot_state(typed.snapshot)});
                     } else if constexpr (
                         std::is_same_v<Typed, ApplyLogEntry>) {
                         actions.emplace_back(simulation::PersistAction{
@@ -575,6 +803,23 @@ private:
                             .to = typed.to,
                             .bytes = encode(typed.response)});
                     } else if constexpr (
+                        std::is_same_v<Typed, SendInstallSnapshot>) {
+                        actions.emplace_back(simulation::SendAction{
+                            .to = typed.to,
+                            .bytes = encode(typed.request)});
+                    } else if constexpr (
+                        std::is_same_v<
+                            Typed,
+                            SendInstallSnapshotResponse>) {
+                        actions.emplace_back(simulation::SendAction{
+                            .to = typed.to,
+                            .bytes = encode(typed.response)});
+                    } else if constexpr (
+                        std::is_same_v<
+                            Typed,
+                            RestoreStateMachineSnapshot>) {
+                        restores.push_back(typed);
+                    } else if constexpr (
                         std::is_same_v<Typed, ResetElectionDeadline>) {
                         actions.emplace_back(simulation::SetTimerAction{
                             .timer_id = typed.timer_id,
@@ -596,6 +841,17 @@ private:
                 },
                 effect);
         }
+        for (const auto& restore : restores) {
+            auto continued = translate(core_->step(
+                RaftSnapshotRestored{
+                    .request_id = restore.request_id,
+                    .index =
+                        restore.snapshot.metadata.last_included_index}));
+            actions.insert(
+                actions.end(),
+                std::make_move_iterator(continued.begin()),
+                std::make_move_iterator(continued.end()));
+        }
         return actions;
     }
 
@@ -611,6 +867,7 @@ private:
     std::vector<simulation::NodeEvent> queued_;
     std::size_t next_leader_command_{};
     std::size_t next_read_request_{};
+    std::size_t next_snapshot_{};
 };
 
 }  // namespace
@@ -625,7 +882,10 @@ Core::Core(
     const simulation::LogicalTime heartbeat_interval,
     const LogIndex recovered_applied,
     const std::size_t max_pending_reads,
-    const std::size_t max_read_history)
+    const std::size_t max_read_history,
+    std::optional<RaftSnapshot> recovered_snapshot,
+    const std::size_t max_snapshot_bytes,
+    const std::size_t max_snapshot_members)
     : state_{
           .node = self,
           .peers = std::move(peers),
@@ -640,7 +900,9 @@ Core::Core(
       heartbeat_interval_(heartbeat_interval),
       random_state_(seed),
       max_pending_reads_(max_pending_reads),
-      max_read_history_(max_read_history) {
+      max_read_history_(max_read_history),
+      max_snapshot_bytes_(max_snapshot_bytes),
+      max_snapshot_members_(max_snapshot_members) {
     if (self.value == 0) {
         throw std::invalid_argument("Raft node ID must be nonzero");
     }
@@ -665,6 +927,12 @@ Core::Core(
     if (max_pending_reads_ == 0 || max_read_history_ < max_pending_reads_) {
         throw std::invalid_argument("invalid ReadIndex limits");
     }
+    if (max_snapshot_bytes_ < 68) {
+        throw std::invalid_argument("invalid Raft snapshot size limit");
+    }
+    if (max_snapshot_members_ < cluster_size) {
+        throw std::invalid_argument("invalid Raft snapshot member limit");
+    }
     if (recovered.current_term == Term{} && recovered.voted_for) {
         throw std::invalid_argument("bootstrap term cannot contain a vote");
     }
@@ -682,7 +950,80 @@ Core::Core(
         throw std::invalid_argument(
             "recovered Raft log entries must have nonzero terms");
     }
-    if (recovered_applied.value > state_.persistent.log.size()) {
+    if (recovered_snapshot) {
+        if (recovered_snapshot->metadata.last_included_index.value == 0
+            || recovered_snapshot->metadata.last_included_term == Term{}
+            || recovered_snapshot->metadata.last_included_term
+                > recovered.current_term
+            || recovered_snapshot->metadata.format_version != 1) {
+            throw std::invalid_argument("invalid recovered Raft snapshot");
+        }
+        const auto& metadata = recovered_snapshot->metadata;
+        if (metadata.store_revision.value < 0
+            || metadata.compaction_revision.value < 0
+            || metadata.compaction_revision
+                > metadata.store_revision) {
+            throw std::invalid_argument(
+                "invalid recovered snapshot revisions");
+        }
+        std::set<NodeId> recovered_members;
+        bool invalid_member = false;
+        for (const auto member : metadata.membership.voters) {
+            invalid_member = invalid_member || member == NodeId{}
+                || !recovered_members.insert(member).second;
+        }
+        for (const auto member : metadata.membership.learners) {
+            invalid_member = invalid_member || member == NodeId{}
+                || !recovered_members.insert(member).second;
+        }
+        std::set<NodeId> expected_voters(state_.peers.begin(), state_.peers.end());
+        expected_voters.insert(state_.node);
+        const std::set<NodeId> snapshot_voters(
+            metadata.membership.voters.begin(),
+            metadata.membership.voters.end());
+        const auto member_count = recovered_members.size();
+        if (invalid_member || snapshot_voters != expected_voters
+            || member_count > max_snapshot_members_
+            || member_count > (max_snapshot_bytes_ - 68) / 8
+            || recovered_snapshot->state.size()
+                > max_snapshot_bytes_ - 68 - member_count * 8) {
+            throw std::invalid_argument(
+                "invalid recovered snapshot membership or size");
+        }
+        durable_snapshot_ = *recovered_snapshot;
+        const auto index =
+            recovered_snapshot->metadata.last_included_index.value;
+        const auto matching = std::ranges::find_if(
+            state_.persistent.log,
+            [index](const LogEntry& entry) {
+                return entry.index.value == index;
+            });
+        if (matching != state_.persistent.log.end()) {
+            if (matching->term
+                != recovered_snapshot->metadata.last_included_term) {
+                throw std::invalid_argument(
+                    "recovered snapshot conflicts with Raft log");
+            }
+            state_.persistent.log.erase(
+                state_.persistent.log.begin(), matching + 1);
+        } else if (
+            !state_.persistent.log.empty()
+            && state_.persistent.log.front().index.value != index + 1) {
+            throw std::invalid_argument(
+                "recovered log does not follow the Raft snapshot");
+        }
+        state_.persistent.snapshot = recovered_snapshot->metadata;
+        state_.volatile_state.commit_index = {
+            std::max(recovered_applied.value, index)};
+        state_.volatile_state.last_applied =
+            state_.volatile_state.commit_index;
+    }
+    const auto recovered_end = state_.persistent.log.empty()
+        ? (state_.persistent.snapshot
+              ? state_.persistent.snapshot->last_included_index.value
+              : 0)
+        : state_.persistent.log.back().index.value;
+    if (state_.volatile_state.last_applied.value > recovered_end) {
         throw std::invalid_argument(
             "recovered applied index exceeds the Raft log");
     }
@@ -704,6 +1045,26 @@ StepResult Core::start() {
 StepResult Core::step(const Input& input) {
     if (!started_) {
         throw std::logic_error("Raft election core has not started");
+    }
+    if (const auto* persisted =
+            std::get_if<RaftSnapshotPersisted>(&input)) {
+        StepResult completed;
+        install_persisted_snapshot(*persisted, completed);
+        complete_ready_reads(completed);
+        schedule_application(completed);
+        return completed;
+    }
+    if (const auto* restored =
+            std::get_if<RaftSnapshotRestored>(&input)) {
+        StepResult completed;
+        complete_snapshot_restore(*restored, completed);
+        complete_ready_reads(completed);
+        schedule_application(completed);
+        return completed;
+    }
+    if (pending_snapshot_ || pending_snapshot_restore_) {
+        throw std::logic_error(
+            "Raft core input is blocked on snapshot persistence/restore");
     }
     if (const auto* applied = std::get_if<LogEntryApplied>(&input)) {
         if (!pending_application_
@@ -769,12 +1130,47 @@ StepResult Core::step(const Input& input) {
         StepResult completed{
             .effects = std::move(pending_log_->deferred_effects)};
         pending_log_.reset();
+        replace_compacted_appends(completed);
         schedule_application(completed);
         return completed;
     }
     if (pending_log_) {
         throw std::logic_error(
             "Raft core input is blocked on log persistence");
+    }
+    if (const auto* persisted =
+            std::get_if<RaftHardStatePersisted>(&input)) {
+        auto completed = translate(
+            figure2::step(state_, *persisted), state_.role);
+        if (install_after_hard_state_
+            && !state_.pending_hard_state) {
+            auto install = std::move(*install_after_hard_state_);
+            install_after_hard_state_.reset();
+            auto continuation = receive_snapshot(install);
+            completed.rules.insert(
+                completed.rules.end(),
+                continuation.rules.begin(),
+                continuation.rules.end());
+            completed.effects.insert(
+                completed.effects.end(),
+                std::make_move_iterator(
+                    continuation.effects.begin()),
+                std::make_move_iterator(
+                    continuation.effects.end()));
+        }
+        return completed;
+    }
+    if (const auto* create =
+            std::get_if<CreateRaftSnapshot>(&input)) {
+        return begin_snapshot(*create);
+    }
+    if (const auto* install =
+            std::get_if<ReceiveInstallSnapshot>(&input)) {
+        return receive_snapshot(*install);
+    }
+    if (const auto* response =
+            std::get_if<ReceiveInstallSnapshotResponse>(&input)) {
+        return receive_snapshot_response(*response);
     }
     if (const auto* read = std::get_if<ReadIndexRequest>(&input)) {
         return begin_read(*read);
@@ -829,6 +1225,14 @@ StepResult Core::step(const Input& input) {
                 std::is_same_v<Typed, ElectionDeadline>
                 || std::is_same_v<Typed, HeartbeatDeadline>
                 || std::is_same_v<Typed, RaftLogPersisted>
+                || std::is_same_v<Typed, RaftHardStatePersisted>
+                || std::is_same_v<Typed, RaftSnapshotPersisted>
+                || std::is_same_v<Typed, RaftSnapshotRestored>
+                || std::is_same_v<Typed, CreateRaftSnapshot>
+                || std::is_same_v<Typed, ReceiveInstallSnapshot>
+                || std::is_same_v<
+                    Typed,
+                    ReceiveInstallSnapshotResponse>
                 || std::is_same_v<Typed, LogEntryApplied>
                 || std::is_same_v<Typed, LogEntryApplyFailed>
                 || std::is_same_v<Typed, RetryApplication>
@@ -865,6 +1269,7 @@ Snapshot Core::snapshot() const {
         .election_timeout = election_timeout_,
         .heartbeat_timer = heartbeat_timer_,
         .log = state_.persistent.log,
+        .snapshot_metadata = state_.persistent.snapshot,
         .peer_progress = std::move(progress),
         .commit_index = state_.volatile_state.commit_index,
         .last_applied = state_.volatile_state.last_applied,
@@ -875,7 +1280,9 @@ Snapshot Core::snapshot() const {
         .completed_read_count = completed_read_count_,
         .rejected_read_count = rejected_read_count_,
         .waiting_for_persistence =
-            state_.pending_hard_state.has_value() || pending_log_.has_value()};
+            state_.pending_hard_state.has_value() || pending_log_.has_value()
+            || pending_snapshot_.has_value()
+            || pending_snapshot_restore_.has_value()};
 }
 
 const figure2::State& Core::specification_state() const noexcept {
@@ -888,6 +1295,11 @@ const PersistRaftLog* Core::pending_log_persistence() const noexcept {
 
 const ApplyLogEntry* Core::pending_application() const noexcept {
     return pending_application_ ? &pending_application_->request : nullptr;
+}
+
+const PersistRaftSnapshot*
+Core::pending_snapshot_persistence() const noexcept {
+    return pending_snapshot_ ? &pending_snapshot_->request : nullptr;
 }
 
 StepResult Core::translate(
@@ -926,6 +1338,7 @@ StepResult Core::translate(
             reject_pending_reads(
                 ReadIndexFailure::leadership_lost,
                 translated);
+            snapshot_transfers_.clear();
         }
     }
 
@@ -963,6 +1376,7 @@ StepResult Core::translate(
             std::move(effect));
     }
     gate_log_persistence(translated);
+    replace_compacted_appends(translated);
     if (!state_.pending_hard_state && !pending_log_) {
         schedule_application(translated);
     }
@@ -987,9 +1401,16 @@ StepResult Core::begin_read(const ReadIndexRequest& request) {
         return reject(ReadIndexFailure::duplicate_request);
     }
     const auto commit = state_.volatile_state.commit_index;
+    const auto base = state_.persistent.snapshot
+        ? state_.persistent.snapshot->last_included_index.value
+        : 0;
+    const auto commit_term = commit.value == base && state_.persistent.snapshot
+        ? state_.persistent.snapshot->last_included_term
+        : (commit.value > base
+               ? state_.persistent.log.at(commit.value - base - 1).term
+               : Term{});
     if (commit == LogIndex{}
-        || state_.persistent.log.at(commit.value - 1).term
-            != state_.persistent.current_term) {
+        || commit_term != state_.persistent.current_term) {
         return reject(ReadIndexFailure::current_term_not_committed);
     }
     if (pending_reads_.size() >= max_pending_reads_
@@ -1018,6 +1439,9 @@ StepResult Core::begin_read(const ReadIndexRequest& request) {
     for (auto& effect : result.effects) {
         if (auto* send = std::get_if<figure2::SendAppendEntries>(&effect)) {
             send->request.read_context = context;
+        } else if (auto* install_send =
+                       std::get_if<SendInstallSnapshot>(&effect)) {
+            install_send->request.read_context = context;
         }
     }
     return result;
@@ -1120,9 +1544,12 @@ void Core::schedule_application(StepResult& result) {
     }
     const LogIndex index{
         state_.volatile_state.last_applied.value + 1};
+    const auto base = state_.persistent.snapshot
+        ? state_.persistent.snapshot->last_included_index.value
+        : 0;
     ApplyLogEntry request{
         .request_id = next_application_request_id_++,
-        .entry = state_.persistent.log.at(index.value - 1)};
+        .entry = state_.persistent.log.at(index.value - base - 1)};
     pending_application_ = PendingApplication{.request = request};
     result.effects.emplace_back(std::move(request));
 }
@@ -1149,6 +1576,456 @@ void Core::gate_log_persistence(StepResult& result) {
     pending_log_ = PendingLogPersistence{
         .request = request,
         .deferred_effects = std::move(deferred)};
+}
+
+void Core::replace_compacted_appends(StepResult& result) {
+    if (!durable_snapshot_ || state_.role != RaftRole::leader
+        || !state_.leader) {
+        return;
+    }
+    for (auto& effect : result.effects) {
+        auto* append = std::get_if<figure2::SendAppendEntries>(&effect);
+        if (!append) {
+            continue;
+        }
+        const auto progress = state_.leader->progress.find(append->to);
+        if (progress == state_.leader->progress.end()
+            || progress->second.next_index.value
+                > durable_snapshot_->metadata.last_included_index.value) {
+            continue;
+        }
+        if (next_snapshot_transfer_id_ == 0
+            || next_snapshot_transfer_id_
+                == std::numeric_limits<std::uint64_t>::max()) {
+            throw std::overflow_error(
+                "Raft snapshot transfer ID exhausted");
+        }
+        const auto context = append->request.read_context;
+        const auto transfer = next_snapshot_transfer_id_++;
+        snapshot_transfers_[append->to] = {
+            .transfer_id = transfer,
+            .term = state_.persistent.current_term,
+            .index = durable_snapshot_->metadata.last_included_index};
+        effect = SendInstallSnapshot{
+            .to = append->to,
+            .request = {
+                .term = state_.persistent.current_term,
+                .leader = state_.node,
+                .transfer_id = transfer,
+                .metadata = durable_snapshot_->metadata,
+                .offset = 0,
+                .total_size = durable_snapshot_->state.size(),
+                .chunk = durable_snapshot_->state,
+                .state_checksum = crc32c(durable_snapshot_->state),
+                .done = true,
+                .read_context = context}};
+    }
+}
+
+StepResult Core::begin_snapshot(const CreateRaftSnapshot& request) {
+    auto reject = [&request](const SnapshotRejection reason) {
+        static_cast<void>(request);
+        return StepResult{
+            .effects = {RaftSnapshotRejected{reason}}};
+    };
+    if (pending_snapshot_) {
+        return reject(SnapshotRejection::persistence_busy);
+    }
+    if (request.applied_index == LogIndex{}
+        || request.applied_index != state_.volatile_state.last_applied) {
+        return reject(SnapshotRejection::no_applied_entry);
+    }
+    if (durable_snapshot_
+        && request.applied_index
+            <= durable_snapshot_->metadata.last_included_index) {
+        return reject(SnapshotRejection::stale);
+    }
+    if (request.store_revision.value < 0
+        || request.compaction_revision.value < 0
+        || request.compaction_revision > request.store_revision) {
+        return reject(SnapshotRejection::invalid_revision);
+    }
+
+    auto membership = request.membership;
+    auto by_id = [](const NodeId left, const NodeId right) {
+        return left.value < right.value;
+    };
+    std::ranges::sort(membership.voters, by_id);
+    std::ranges::sort(membership.learners, by_id);
+    const auto duplicate = [](const std::vector<NodeId>& members) {
+        return std::adjacent_find(members.begin(), members.end())
+            != members.end();
+    };
+    std::vector<NodeId> expected = state_.peers;
+    expected.push_back(state_.node);
+    std::ranges::sort(expected, by_id);
+    if (membership.voters != expected
+        || duplicate(membership.voters)
+        || duplicate(membership.learners)
+        || std::ranges::find(membership.learners, NodeId{})
+            != membership.learners.end()
+        || std::ranges::any_of(
+            membership.learners,
+            [&membership](const NodeId node) {
+                return std::ranges::find(membership.voters, node)
+                    != membership.voters.end();
+            })
+        || membership.voters.size() + membership.learners.size()
+            > max_snapshot_members_) {
+        return reject(SnapshotRejection::invalid_membership);
+    }
+    const auto overhead = 68ULL
+        + 8ULL
+            * (membership.voters.size() + membership.learners.size());
+    if (overhead > max_snapshot_bytes_
+        || request.state.size() > max_snapshot_bytes_ - overhead) {
+        return reject(SnapshotRejection::too_large);
+    }
+
+    const auto base = state_.persistent.snapshot
+        ? state_.persistent.snapshot->last_included_index.value
+        : 0;
+    Term term;
+    if (request.applied_index.value == base && state_.persistent.snapshot) {
+        term = state_.persistent.snapshot->last_included_term;
+    } else {
+        term = state_.persistent.log.at(
+            request.applied_index.value - base - 1).term;
+    }
+    RaftSnapshot snapshot{
+        .metadata = {
+            .last_included_index = request.applied_index,
+            .last_included_term = term,
+            .store_revision = request.store_revision,
+            .compaction_revision = request.compaction_revision,
+            .membership = std::move(membership),
+            .format_version = 1},
+        .state = request.state,
+        .checksum = crc32c(request.state)};
+    if (next_snapshot_request_id_ == 0
+        || next_snapshot_request_id_ >= (1ULL << 62)) {
+        throw std::overflow_error(
+            "Raft snapshot persistence request ID exhausted");
+    }
+    PersistRaftSnapshot persistence{
+        .request_id = next_snapshot_request_id_++,
+        .snapshot = std::move(snapshot)};
+    pending_snapshot_ = PendingSnapshotPersistence{
+        .request = persistence,
+        .local_creation = true};
+    return {.effects = {std::move(persistence)}};
+}
+
+StepResult Core::receive_snapshot(
+    const ReceiveInstallSnapshot& event) {
+    if (std::ranges::find(state_.peers, event.from)
+            == state_.peers.end()
+        || event.request.leader != event.from) {
+        throw std::invalid_argument(
+            "InstallSnapshot sender is not its voting leader");
+    }
+    auto rejection = [this, &event]() {
+        return StepResult{
+            .effects = {
+                SendInstallSnapshotResponse{
+                    event.from,
+                    {
+                        .term = state_.persistent.current_term,
+                        .transfer_id = event.request.transfer_id,
+                        .succeeded = false,
+                        .read_context = event.request.read_context}}}};
+    };
+    if (event.request.term < state_.persistent.current_term) {
+        return rejection();
+    }
+    if (event.request.term > state_.persistent.current_term) {
+        install_after_hard_state_ = event;
+        return translate(
+            figure2::step(
+                state_, figure2::ObserveTerm{event.request.term}),
+            state_.role);
+    }
+    if (pending_snapshot_) {
+        return rejection();
+    }
+
+    figure2::StepResult accepted{.state = state_};
+    accepted.state.role = RaftRole::follower;
+    accepted.state.leader.reset();
+    accepted.state.votes_received.clear();
+    accepted.state.known_leader = event.from;
+    accepted.effects.emplace_back(figure2::ResetElectionTimer{});
+    auto result = translate(std::move(accepted), state_.role);
+
+    const auto& request = event.request;
+    const auto& metadata = request.metadata;
+    const auto voter_count = metadata.membership.voters.size();
+    const auto learner_count = metadata.membership.learners.size();
+    const bool member_size_valid =
+        voter_count <= max_snapshot_members_
+        && learner_count <= max_snapshot_members_
+        && voter_count <= max_snapshot_members_ - learner_count
+        && voter_count <= (max_snapshot_bytes_ - 68) / 8
+        && learner_count <= (max_snapshot_bytes_ - 68) / 8
+        && voter_count
+            <= (max_snapshot_bytes_ - 68) / 8 - learner_count;
+    const auto member_count =
+        member_size_valid ? voter_count + learner_count : 0;
+    const bool state_size_valid =
+        request.total_size <= max_snapshot_bytes_;
+    const auto encoded_size = member_size_valid && state_size_valid
+        ? 68ULL + 8ULL * member_count + request.total_size
+        : std::numeric_limits<std::uint64_t>::max();
+    const bool valid_shape = member_size_valid && state_size_valid
+        && request.transfer_id != 0
+        && request.offset == 0 && request.done
+        && request.total_size == request.chunk.size()
+        && encoded_size >= request.total_size
+        && encoded_size <= max_snapshot_bytes_
+        && metadata.last_included_index.value != 0
+        && metadata.last_included_term != Term{}
+        && metadata.last_included_term <= request.term
+        && metadata.format_version == 1
+        && metadata.store_revision.value >= 0
+        && metadata.compaction_revision.value >= 0
+        && metadata.compaction_revision <= metadata.store_revision;
+    if (!valid_shape
+        || crc32c(request.chunk) != request.state_checksum) {
+        auto failed = rejection();
+        result.effects.insert(
+            result.effects.end(),
+            std::make_move_iterator(failed.effects.begin()),
+            std::make_move_iterator(failed.effects.end()));
+        return result;
+    }
+    auto voters = metadata.membership.voters;
+    auto expected = state_.peers;
+    expected.push_back(state_.node);
+    auto by_id = [](const NodeId left, const NodeId right) {
+        return left.value < right.value;
+    };
+    std::ranges::sort(voters, by_id);
+    std::ranges::sort(expected, by_id);
+    std::set<NodeId> unique;
+    bool contains_zero = false;
+    for (const auto voter : metadata.membership.voters) {
+        contains_zero = contains_zero || voter == NodeId{};
+        unique.insert(voter);
+    }
+    for (const auto learner : metadata.membership.learners) {
+        contains_zero = contains_zero || learner == NodeId{};
+        unique.insert(learner);
+    }
+    if (voters != expected
+        || contains_zero
+        || !std::ranges::is_sorted(
+            metadata.membership.voters, by_id)
+        || !std::ranges::is_sorted(
+            metadata.membership.learners, by_id)
+        || unique.size()
+            != metadata.membership.voters.size()
+                + metadata.membership.learners.size()) {
+        auto failed = rejection();
+        result.effects.insert(
+            result.effects.end(),
+            std::make_move_iterator(failed.effects.begin()),
+            std::make_move_iterator(failed.effects.end()));
+        return result;
+    }
+
+    if (durable_snapshot_
+        && metadata.last_included_index
+            <= durable_snapshot_->metadata.last_included_index) {
+        InstallSnapshotResponse response{
+            .term = state_.persistent.current_term,
+            .transfer_id = request.transfer_id,
+            .succeeded =
+                metadata == durable_snapshot_->metadata
+                && request.chunk == durable_snapshot_->state,
+            .last_included_index =
+                durable_snapshot_->metadata.last_included_index,
+            .read_context = request.read_context};
+        result.effects.emplace_back(
+            SendInstallSnapshotResponse{event.from, response});
+        return result;
+    }
+    if (metadata.last_included_index
+        <= state_.volatile_state.last_applied) {
+        auto failed = rejection();
+        result.effects.insert(
+            result.effects.end(),
+            std::make_move_iterator(failed.effects.begin()),
+            std::make_move_iterator(failed.effects.end()));
+        return result;
+    }
+
+    RaftSnapshot snapshot{
+        .metadata = metadata,
+        .state = request.chunk,
+        .checksum = request.state_checksum};
+    if (next_snapshot_request_id_ == 0
+        || next_snapshot_request_id_ >= (1ULL << 62)) {
+        throw std::overflow_error(
+            "Raft snapshot persistence request ID exhausted");
+    }
+    PersistRaftSnapshot persistence{
+        .request_id = next_snapshot_request_id_++,
+        .snapshot = snapshot};
+    pending_snapshot_ = PendingSnapshotPersistence{
+        .request = persistence,
+        .reply_to = event.from,
+        .response = InstallSnapshotResponse{
+            .term = state_.persistent.current_term,
+            .transfer_id = request.transfer_id,
+            .succeeded = true,
+            .last_included_index = metadata.last_included_index,
+            .read_context = request.read_context}};
+    result.effects.emplace_back(std::move(persistence));
+    return result;
+}
+
+void Core::compact_to(const RaftSnapshot& snapshot) {
+    const auto index = snapshot.metadata.last_included_index.value;
+    const auto base = state_.persistent.snapshot
+        ? state_.persistent.snapshot->last_included_index.value
+        : 0;
+    bool preserve_suffix = false;
+    if (index == base && state_.persistent.snapshot) {
+        preserve_suffix =
+            state_.persistent.snapshot->last_included_term
+            == snapshot.metadata.last_included_term;
+    } else if (index > base) {
+        const auto offset = index - base - 1;
+        preserve_suffix = offset < state_.persistent.log.size()
+            && state_.persistent.log[offset].term
+                == snapshot.metadata.last_included_term;
+        if (preserve_suffix) {
+            state_.persistent.log.erase(
+                state_.persistent.log.begin(),
+                state_.persistent.log.begin()
+                    + static_cast<std::ptrdiff_t>(offset + 1));
+        }
+    }
+    if (!preserve_suffix) {
+        state_.persistent.log.clear();
+    }
+    state_.persistent.snapshot = snapshot.metadata;
+    state_.volatile_state.commit_index.value =
+        std::max(state_.volatile_state.commit_index.value, index);
+    state_.volatile_state.last_applied.value =
+        std::max(state_.volatile_state.last_applied.value, index);
+    if (pending_application_
+        && pending_application_->request.entry.index.value <= index) {
+        pending_application_.reset();
+    }
+    durable_snapshot_ = snapshot;
+}
+
+void Core::install_persisted_snapshot(
+    const RaftSnapshotPersisted& completion,
+    StepResult& result) {
+    if (!pending_snapshot_
+        || completion.request_id
+            != pending_snapshot_->request.request_id
+        || completion.snapshot.metadata
+            != pending_snapshot_->request.snapshot.metadata
+        || completion.snapshot.state
+            != pending_snapshot_->request.snapshot.state) {
+        throw std::invalid_argument(
+            "Raft snapshot completion does not match pending request");
+    }
+    auto pending = std::move(*pending_snapshot_);
+    pending_snapshot_.reset();
+    auto snapshot = pending.request.snapshot;
+    snapshot.checksum = crc32c(snapshot.state);
+    if (pending.local_creation) {
+        compact_to(snapshot);
+        result.effects.emplace_back(TruncateRaftLogPrefix{
+            snapshot.metadata.last_included_index});
+        result.effects.emplace_back(RaftSnapshotCreated{
+            snapshot.metadata.last_included_index});
+    } else {
+        pending_snapshot_restore_ = PendingSnapshotRestore{
+            .request_id = completion.request_id,
+            .snapshot = snapshot,
+            .reply_to = *pending.reply_to,
+            .response = *pending.response};
+        result.effects.emplace_back(RestoreStateMachineSnapshot{
+            .request_id = completion.request_id,
+            .snapshot = std::move(snapshot)});
+    }
+}
+
+void Core::complete_snapshot_restore(
+    const RaftSnapshotRestored& completion,
+    StepResult& result) {
+    if (!pending_snapshot_restore_
+        || completion.request_id
+            != pending_snapshot_restore_->request_id
+        || completion.index
+            != pending_snapshot_restore_->snapshot.metadata
+                   .last_included_index) {
+        throw std::invalid_argument(
+            "Raft snapshot restore completion does not match pending restore");
+    }
+    auto pending = std::move(*pending_snapshot_restore_);
+    pending_snapshot_restore_.reset();
+    compact_to(pending.snapshot);
+    result.effects.emplace_back(TruncateRaftLogPrefix{
+        pending.snapshot.metadata.last_included_index});
+    result.effects.emplace_back(SendInstallSnapshotResponse{
+        pending.reply_to, pending.response});
+}
+
+StepResult Core::receive_snapshot_response(
+    const ReceiveInstallSnapshotResponse& event) {
+    if (std::ranges::find(state_.peers, event.from)
+        == state_.peers.end()) {
+        throw std::invalid_argument(
+            "InstallSnapshot response is from a non-peer");
+    }
+    if (event.response.term > state_.persistent.current_term) {
+        return translate(
+            figure2::step(
+                state_, figure2::ObserveTerm{event.response.term}),
+            state_.role);
+    }
+    if (state_.role != RaftRole::leader
+        || event.response.term != state_.persistent.current_term
+        || !event.response.succeeded || !durable_snapshot_
+        || event.response.last_included_index
+            != durable_snapshot_->metadata.last_included_index) {
+        return {};
+    }
+    const auto transfer = snapshot_transfers_.find(event.from);
+    if (transfer == snapshot_transfers_.end()
+        || transfer->second.transfer_id != event.response.transfer_id
+        || transfer->second.term != event.response.term
+        || transfer->second.index
+            != event.response.last_included_index) {
+        return {};
+    }
+    snapshot_transfers_.erase(transfer);
+    figure2::ReceiveAppendEntriesResponse synthetic{
+        .from = event.from,
+        .response = {
+            .term = event.response.term,
+            .succeeded = true,
+            .matched_index = event.response.last_included_index,
+            .read_context = event.response.read_context}};
+    auto result = translate(
+        figure2::step(state_, synthetic), state_.role);
+    acknowledge_read(synthetic, result);
+    auto resume = translate(
+        figure2::step(state_, figure2::HeartbeatTimeout{}),
+        state_.role);
+    result.rules.insert(
+        result.rules.end(), resume.rules.begin(), resume.rules.end());
+    result.effects.insert(
+        result.effects.end(),
+        std::make_move_iterator(resume.effects.begin()),
+        std::make_move_iterator(resume.effects.end()));
+    return result;
 }
 
 ResetElectionDeadline Core::next_deadline() {

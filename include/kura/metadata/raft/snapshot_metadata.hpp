@@ -16,6 +16,8 @@ struct SnapshotMetadata {
     Revision compaction_revision;
     ClusterMembership membership;
     std::uint32_t format_version{};
+
+    bool operator==(const SnapshotMetadata&) const = default;
 };
 
 }  // namespace kura::metadata

@@ -2,6 +2,7 @@
 
 #include "kura/metadata/raft/log_entry.hpp"
 #include "kura/metadata/raft/node_id.hpp"
+#include "kura/metadata/raft/snapshot_metadata.hpp"
 #include "kura/metadata/raft/term.hpp"
 
 #include <optional>
@@ -19,6 +20,7 @@ struct RaftHardState {
 struct PersistentRaftState {
     Term current_term;
     std::optional<NodeId> voted_for;
+    std::optional<SnapshotMetadata> snapshot;
     std::vector<LogEntry> log;
 };
 

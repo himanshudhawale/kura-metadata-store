@@ -74,9 +74,9 @@ This phase is durable but remains single-node and not highly available.
 ## Phase 4: Raft replication
 
 **Status:** Started. Deterministic elections, RequestVote, AppendEntries log
-replication, majority commitment, and ordered application are implemented in
-the first four internal core slices, including quorum-confirmed ReadIndex.
-Snapshots and distributed service integration remain unimplemented.
+replication, majority commitment, ordered application, quorum-confirmed
+ReadIndex, and snapshot installation are implemented in the first five
+internal core slices. Distributed service integration remains unimplemented.
 
 Deliver:
 

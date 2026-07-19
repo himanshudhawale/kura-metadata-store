@@ -323,7 +323,7 @@ The internal Raft core is event driven:
 
 ```text
 Core(self, peers, recoveredHardState, seed, timeoutRange,
-     localLog, heartbeatInterval, recoveredApplied)
+     localLog, heartbeatInterval, recoveredApplied, ..., recoveredSnapshot)
 start()                 -> ordered effects
 step(typed input)       -> ordered effects
 snapshot()              -> immutable diagnostic state
@@ -354,7 +354,18 @@ commit index only after a quorum and `lastApplied` reaches that index.
 Cancellation, timeout, capacity, replay, and leadership loss return typed
 rejections rather than stale success.
 
+Slice 5 adds `CreateRaftSnapshot`, InstallSnapshot request/response inputs, and
+explicit snapshot publication and state-machine restore completions. A local
+snapshot may represent only `lastApplied`. `PersistRaftSnapshot` must be mapped
+to the existing atomic `SnapshotStore`; only its matching completion unlocks
+`TruncateRaftLogPrefix`. Followers validate bounded whole-snapshot offset,
+membership, revision, and CRC32C fields, then restore before success. Leaders
+fall back to InstallSnapshot when `nextIndex` crosses the compacted boundary
+and resume AppendEntries at the retained suffix. The typed contract is not a
+production network protocol.
+
 Details are in [Design 0009](design/0009-raft-election-core.md),
 [Design 0011](design/0011-raft-append-entries.md), and
 [Design 0012](design/0012-raft-commit-apply.md), and
-[Design 0013](design/0013-raft-read-index.md).
+[Design 0013](design/0013-raft-read-index.md), and
+[Design 0014](design/0014-raft-snapshots.md).

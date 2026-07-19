@@ -4,9 +4,8 @@
 
 Accepted as the Phase 4 simulation foundation. The original change supplied a
 logical-time scheduler and deterministic probe. The adapter now drives
-RequestVote, AppendEntries, majority commitment, and ordered application;
-ReadIndex is also integrated. Snapshots and a distributed service remain
-absent.
+RequestVote, AppendEntries, majority commitment, ordered application,
+ReadIndex, and snapshot installation. A distributed service remains absent.
 
 ## Problem
 

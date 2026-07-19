@@ -11,6 +11,10 @@ membership changes, a production transport, or the final client read path.
 `ReadIndexResponse` is permission to read state at an applied index, not the
 key/value read itself.
 
+Snapshot installation was subsequently added by
+[Design 0014](0014-raft-snapshots.md); this document retains the reviewed
+slice 4 boundary and rationale.
+
 ## Problem and why
 
 Being the last elected leader is not enough to serve a linearizable read. A
