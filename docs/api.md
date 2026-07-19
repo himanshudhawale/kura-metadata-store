@@ -31,6 +31,9 @@ made entirely of `0xff` bytes has no finite upper bound, so the helper returns
 `std::nullopt`; callers must handle that case explicitly rather than passing a
 sentinel as a range end.
 
+Design rationale and rejected alternatives are documented in
+[Design 0001: Binary prefix range](design/0001-binary-prefix-range.md).
+
 ## 2. Key-value metadata
 
 ```text
