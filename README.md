@@ -6,6 +6,10 @@ coordination primitives for distributed systems and serve as
 [Kura Engine](https://github.com/himanshudhawale/kura-engine)'s metadata
 authority.
 
+The service is implemented in modern **C++23** for predictable latency,
+explicit memory ownership, efficient binary protocols, and direct control over
+WAL, networking, and state-machine execution.
+
 > **Current status:** Phase 1 is a single-node, in-memory deterministic state
 > machine. It is not distributed, replicated, durable, or highly available.
 > Do not use it for production metadata.
@@ -92,17 +96,23 @@ snapshot becomes current. See [Kura integration](docs/kura-integration.md).
 - [Correctness traps](docs/correctness-traps.md)
 - [Research sources](docs/research-sources.md)
 - [ADR-0001: phase claims](docs/decisions/0001-phase-claims.md)
+- [ADR-0002: C++23 implementation](docs/decisions/0002-cpp23-implementation.md)
 
 ## Build
 
 Requirements:
 
-- Java 21
-- Maven 3.9+
+- A C++23 compiler
+- CMake 3.25+
 
 ```shell
-mvn test
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
 ```
+
+`--config Release` and `-C Release` are required by multi-configuration
+generators such as Visual Studio and harmless for single-configuration builds.
 
 ## Contributing
 
